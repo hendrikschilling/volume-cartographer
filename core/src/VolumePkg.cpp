@@ -38,7 +38,7 @@ inline auto TfmDir(const fs::path& baseDir) -> fs::path
 
 inline auto PreviewDirs(const fs::path& baseDir) -> std::vector<filesystem::path>
 {
-    return { baseDir / "volumes_preview_half", baseDir / "volumes_masked", baseDir / "volumes_previews"};
+    return { baseDir / "volumes_preview", baseDir / "volumes_masked"};
 }
 
 inline auto ReqDirs(const fs::path& baseDir) -> std::vector<filesystem::path>
