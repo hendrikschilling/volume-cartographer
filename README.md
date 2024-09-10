@@ -5,6 +5,9 @@ virtually unwrapping volumetric datasets. It was designed to recover text from
 CT scans of ancient, badly damaged manuscripts, but can be applied in many
 volumetric analysis applications.
 
+## Experimental Changes 2024
+- Added preview functionality allowing the selection of masked and compressed (https://github.com/hendrikschilling/vesuvius_compressed_dl) volumes.
+
 ## Changes 2024
 - Merged in latest version from Educelab (state 2024-05-08)
 - Added memory-mapped (`mmap`) TIFF loading which improves loading speed and therefore results in smoother slice scanning plus drastically reduces RAM usage
