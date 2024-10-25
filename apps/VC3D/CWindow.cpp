@@ -502,13 +502,6 @@ void CWindow::OpenVolume(const QString& path)
 
     treeWidgetSurfaces->clear();
 
-
-    QTreeWidgetItem *item = new QTreeWidgetItem(treeWidgetSurfaces);
-    item->setText(0, QString("experiment"));
-    item->setData(0, Qt::UserRole, QVariant("experiment"));
-
-    _opchains["experiment"] = new OpChain(empty_space_tracing_quad(currentVolume->zarrDataset(1), 0.5, chunk_cache, {5646,2756,2000}, {5688,2786,2000}, 5));
-
     for (auto& s : fVpkg->segmentationFiles()) {
         QTreeWidgetItem *item = new QTreeWidgetItem(treeWidgetSurfaces);
         item->setText(0, QString(seg_path_name(s.string()).c_str()));

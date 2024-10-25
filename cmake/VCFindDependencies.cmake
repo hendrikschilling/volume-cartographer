@@ -47,9 +47,6 @@ include(${ITK_USE_FILE})
 ### VTK ###
 find_package(VTK 9 QUIET REQUIRED)
 
-#ceres-solver
-find_package(Ceres REQUIRED)
-
 ### ACVD ###
 include(BuildACVD)
 
