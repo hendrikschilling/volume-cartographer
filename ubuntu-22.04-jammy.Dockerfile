@@ -1,5 +1,7 @@
 FROM ubuntu:jammy
 
+ENV DEBIAN_FRONTEND=noninteractive
+
 RUN apt-get update
 RUN apt-get upgrade
 RUN apt -y install build-essential git cmake
