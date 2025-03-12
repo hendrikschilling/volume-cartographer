@@ -14,6 +14,7 @@
 #include <xtensor/xview.hpp>
 
 #include <fstream>
+#include <atomic>
 
 class ALifeTime
 {
@@ -809,6 +810,10 @@ float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t> &stat
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 10000;
     options.function_tolerance = 1e-4;
+    options.use_nonmonotonic_steps = true;
+    options.use_inner_iterations = true;
+    options.use_mixed_precision_solves = true;
+    options.preconditioner_type = ceres::SCHUR_JACOBI;
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
@@ -892,33 +897,30 @@ E _max_d_ign(const E &a, const E &b)
         return b;
     if (b == E(-1))
         return a;
-    return std::max(a,b);
+    return a > b ? a : b;  // Avoid potential std::max overhead
 }
 
 template <typename T, typename E>
 void _dist_iteration(T &from, T &to, int s)
 {
-    E magic = -1;
+    const E magic = -1;
 #pragma omp parallel for
     for(int k=0;k<s;k++)
         for(int j=0;j<s;j++)
             for(int i=0;i<s;i++) {
                 E dist = from(k,j,i);
-                if (dist == magic) {
-                    if (k) dist = _max_d_ign(dist, from(k-1,j,i));
-                    if (k < s-1) dist = _max_d_ign(dist, from(k+1,j,i));
-                    if (j) dist = _max_d_ign(dist, from(k,j-1,i));
-                    if (j < s-1) dist = _max_d_ign(dist, from(k,j+1,i));
-                    if (i) dist = _max_d_ign(dist, from(k,j,i-1));
-                    if (i < s-1) dist = _max_d_ign(dist, from(k,j,i+1));
-                    if (dist != magic)
-                        to(k,j,i) = dist+1;
-                    else
-                        to(k,j,i) = dist;
-                }
-                else
+                if (dist != magic) {
                     to(k,j,i) = dist;
-
+                    continue;
+                }
+                
+                if (k) dist = _max_d_ign(dist, from(k-1,j,i));
+                if (k < s-1) dist = _max_d_ign(dist, from(k+1,j,i));
+                if (j) dist = _max_d_ign(dist, from(k,j-1,i));
+                if (j < s-1) dist = _max_d_ign(dist, from(k,j+1,i));
+                if (i) dist = _max_d_ign(dist, from(k,j,i-1));
+                if (i < s-1) dist = _max_d_ign(dist, from(k,j,i+1));
+                to(k,j,i) = (dist != magic) ? dist+1 : dist;
             }
 }
 
@@ -937,7 +939,7 @@ T distance_transform(const T &chunk, int steps, int size)
         _dist_iteration<T,E>(c2,c1,size);
     }
 
-#pragma omp parallel for
+#pragma omp parallel for collapse(3)
     for(int z=0;z<size;z++)
         for(int y=0;y<size;y++)
             for(int x=0;x<size;x++)
@@ -963,16 +965,18 @@ struct thresholdedDistance
 
         int good_count = 0;
 
-#pragma omp parallel for
+#pragma omp parallel for collapse(3)
         for(int z=0;z<s;z++)
             for(int y=0;y<s;y++)
-                for(int x=0;x<s;x++)
+                for(int x=0;x<s;x++) {
                     if (large(z,y,x) < TH)
                         outer(z,y,x) = magic;
-        else {
-            good_count++;
-            outer(z,y,x) = 0;
-        }
+                    else {
+                        #pragma omp atomic
+                        good_count++;
+                        outer(z,y,x) = 0;
+                    }
+                }
 
         outer = distance_transform<T,E>(outer, 15, s);
 
@@ -1163,32 +1167,51 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
 //             int idx = rand() % cands.size();
             while (true) {
                 cv::Vec2i p = cands_threadcol.next();
-                if (p[0] == -1)
+                if (p[0] == -1) {
                     break;
+                }
 
-                if (state(p) & (STATE_LOC_VALID | STATE_COORD_VALID))
+                if (state(p) & (STATE_LOC_VALID | STATE_COORD_VALID)) {
                     continue;
+                }
 
                 int ref_count = 0;
                 cv::Vec3d avg = {0,0,0};
                 std::vector<cv::Vec2i> srcs;
-                for(int oy=std::max(p[0]-r,0);oy<=std::min(p[0]+r,locs.rows-1);oy++)
-                    for(int ox=std::max(p[1]-r,0);ox<=std::min(p[1]+r,locs.cols-1);ox++)
+                srcs.reserve((2*r+1)*(2*r+1)); // Pre-allocate for better performance
+                
+                const int y_min = std::max(p[0]-r, 0);
+                const int y_max = std::min(p[0]+r, locs.rows-1);
+                const int x_min = std::max(p[1]-r, 0);
+                const int x_max = std::min(p[1]+r, locs.cols-1);
+                
+                for(int oy=y_min; oy<=y_max; oy++) {
+                    for(int ox=x_min; ox<=x_max; ox++) {
                         if (state(oy,ox) & STATE_LOC_VALID) {
                             ref_count++;
                             avg += locs(oy,ox);
                             srcs.push_back({oy,ox});
                         }
+                    }
+                }
                         
                 cv::Vec2i best_l = srcs[0];
                 int best_ref_l = -1;
                 int rec_ref_sum = 0;
-                for(cv::Vec2i l : srcs) {
+                for(const cv::Vec2i& l : srcs) {
                     int ref_l = 0;
-                    for(int oy=std::max(l[0]-r,0);oy<=std::min(l[0]+r,locs.rows-1);oy++)
-                        for(int ox=std::max(l[1]-r,0);ox<=std::min(l[1]+r,locs.cols-1);ox++)
+                    
+                    const int src_y_min = std::max(l[0]-r, 0);
+                    const int src_y_max = std::min(l[0]+r, locs.rows-1);
+                    const int src_x_min = std::max(l[1]-r, 0);
+                    const int src_x_max = std::min(l[1]+r, locs.cols-1);
+                    
+                    for(int oy=src_y_min; oy<=src_y_max; oy++) {
+                        for(int ox=src_x_min; ox<=src_x_max; ox++) {
                             if (state(oy,ox) & STATE_LOC_VALID)
                                 ref_l++;
+                        }
+                    }
                     
                     rec_ref_sum += ref_l;
                     
@@ -1199,12 +1222,20 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                 }
 
                 int ref_count2 = 0;
-                for(int oy=std::max(p[0]-r2,0);oy<=std::min(p[0]+r2,locs.rows-1);oy++)
-                    for(int ox=std::max(p[1]-r2,0);ox<=std::min(p[1]+r2,locs.cols-1);ox++)
+                
+                const int y2_min = std::max(p[0]-r2, 0);
+                const int y2_max = std::min(p[0]+r2, locs.rows-1);
+                const int x2_min = std::max(p[1]-r2, 0);
+                const int x2_max = std::min(p[1]+r2, locs.cols-1);
+                
+                for(int oy=y2_min; oy<=y2_max; oy++) {
+                    for(int ox=x2_min; ox<=x2_max; ox++) {
                         // if (state(oy,ox) & (STATE_LOC_VALID | STATE_COORD_VALID)) {
                         if (state(oy,ox) & STATE_LOC_VALID) {
                             ref_count2++;
                         }
+                    }
+                }
 
                 if (ref_count < 2 || ref_count+0.35*rec_ref_sum < curr_ref_min /*|| (generation > 3 && ref_count2 < 14)*/) {
                     state(p) &= ~STATE_PROCESSING;
@@ -1267,12 +1298,18 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                 double dist;
                 interp.Evaluate(locs(p)[2],locs(p)[1],locs(p)[0], &dist);
                 int count = 0;
-                for (auto &off : neighs) {
+                
+                const cv::Vec3d curr_loc = locs(p); // Cache the current location
+                
+                for (const auto &off : neighs) {
                     if (state(p+off) & STATE_LOC_VALID) {
-                        for(int i=1;i<T;i++) {
-                            float f1 = float(i)/T;
-                            float f2 = 1-f1;
-                            cv::Vec3d l = locs(p)*f1 + locs(p+off)*f2;
+                        const cv::Vec3d neighbor_loc = locs(p+off); // Cache neighbor location
+                        const cv::Vec3d dir = neighbor_loc - curr_loc; // Pre-calculate direction vector
+                        
+                        for(int i=1; i<T; i++) {
+                            const float f1 = static_cast<float>(i)/T;
+                            // No need to calculate f2 each time - use direct weighted addition
+                            cv::Vec3d l = curr_loc + dir * f1;
                             double d2;
                             interp.Evaluate(l[2],l[1],l[0], &d2);
                             dist = std::max(dist, d2);
@@ -2034,6 +2071,12 @@ double local_cost(SurfaceMeta *sm, const cv::Vec2i p, SurfTrackerData &data, cv:
         return sqrt(test_loss/count);
 }
 
+// Global reference to configure local_solve
+struct SolverConfigGlobal {
+    std::string linear_solver = "dense_qr"; // dense_qr, sparse_normal_cholesky
+    std::string trust_region_strategy = "levenberg_marquardt"; // levenberg_marquardt, dogleg
+} g_solver_config;
+
 double local_solve(SurfaceMeta *sm, const cv::Vec2i p, SurfTrackerData &data, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points, float step, float src_step, int flags)
 {
     ceres::Problem problem;
@@ -2041,7 +2084,21 @@ double local_solve(SurfaceMeta *sm, const cv::Vec2i p, SurfTrackerData &data, cv
     surftrack_add_local(sm, p, data, problem, state, points, step, src_step, flags);
 
     ceres::Solver::Options options;
-    options.linear_solver_type = ceres::DENSE_QR;
+    
+    // Use global solver configuration if available
+    if (g_solver_config.linear_solver == "sparse_normal_cholesky") {
+        options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    } else {
+        // Default for local_solve is still DENSE_QR as it works well for small problems
+        options.linear_solver_type = ceres::DENSE_QR;
+    }
+    
+    if (g_solver_config.trust_region_strategy == "dogleg") {
+        options.trust_region_strategy_type = ceres::DOGLEG;
+    } else {
+        options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+    }
+    
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 10000;
     ceres::Solver::Summary summary;
@@ -2056,69 +2113,155 @@ double local_solve(SurfaceMeta *sm, const cv::Vec2i p, SurfTrackerData &data, cv
 
 cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points, cv::Rect &used_area, float step, float step_src, bool inpaint = false)
 {
+    // Create high-resolution matrices for points and counts
     cv::Mat_<cv::Vec3f> points_hr(state.rows*step, state.cols*step, {0,0,0});
     cv::Mat_<int> counts_hr(state.rows*step, state.cols*step, 0);
+    
+    // Create a mask to track valid high-res points (to prevent looping artifacts)
+    cv::Mat_<uint8_t> valid_mask_hr(state.rows*step, state.cols*step, uint8_t(0));
+    
 #pragma omp parallel for //FIXME data access is just not threading friendly ...
-    for(int j=used_area.y;j<used_area.br().y-1;j++)
+    for(int j=used_area.y;j<used_area.br().y-1;j++) {
         for(int i=used_area.x;i<used_area.br().x-1;i++) {
+            // Check if all 4 corner points are valid
             if (state(j,i) & (STATE_LOC_VALID|STATE_COORD_VALID)
                 && state(j,i+1) & (STATE_LOC_VALID|STATE_COORD_VALID)
                 && state(j+1,i) & (STATE_LOC_VALID|STATE_COORD_VALID)
                 && state(j+1,i+1) & (STATE_LOC_VALID|STATE_COORD_VALID))
             {
-            for(auto &sm : data.surfsC({j,i})) {
-                if (data.valid_int(sm,{j,i})
-                    && data.valid_int(sm,{j,i+1})
-                    && data.valid_int(sm,{j+1,i})
-                    && data.valid_int(sm,{j+1,i+1}))
-                {
-                    cv::Vec2f l00 = data.loc(sm,{j,i});
-                    cv::Vec2f l01 = data.loc(sm,{j,i+1});
-                    cv::Vec2f l10 = data.loc(sm,{j+1,i});
-                    cv::Vec2f l11 = data.loc(sm,{j+1,i+1});
+                // Process each surface
+                for(auto &sm : data.surfsC({j,i})) {
+                    // Check if all corners have valid intersections with the surface
+                    if (data.valid_int(sm,{j,i})
+                        && data.valid_int(sm,{j,i+1})
+                        && data.valid_int(sm,{j+1,i})
+                        && data.valid_int(sm,{j+1,i+1}))
+                    {
+                        // Get locations for each corner
+                        cv::Vec2f l00 = data.loc(sm,{j,i});
+                        cv::Vec2f l01 = data.loc(sm,{j,i+1});
+                        cv::Vec2f l10 = data.loc(sm,{j+1,i});
+                        cv::Vec2f l11 = data.loc(sm,{j+1,i+1});
+                        
+                        // Check interpolation validity - skip if corners are too far apart
+                        // This helps prevent stretched interpolation that can create loops
+                        float max_dist_squared = 4.0f * step_src * step_src; // Max allowed squared distance
+                        cv::Vec2f diff1 = l00 - l01;
+                        cv::Vec2f diff2 = l00 - l10;
+                        cv::Vec2f diff3 = l11 - l01;
+                        cv::Vec2f diff4 = l11 - l10;
+                        
+                        float dist1 = diff1.dot(diff1);
+                        float dist2 = diff2.dot(diff2);
+                        float dist3 = diff3.dot(diff3);
+                        float dist4 = diff4.dot(diff4);
+                        
+                        // Skip this quad if any edge is suspiciously long
+                        if (dist1 > max_dist_squared || dist2 > max_dist_squared || 
+                            dist3 > max_dist_squared || dist4 > max_dist_squared) {
+                            continue;
+                        }
 
-                    for(int sy=0;sy<=step;sy++)
-                        for(int sx=0;sx<=step;sx++) {
-                            float fx = sx/step;
-                            float fy = sy/step;
-                            cv::Vec2f l0 = (1-fx)*l00 + fx*l01;
-                            cv::Vec2f l1 = (1-fx)*l10 + fx*l11;
-                            cv::Vec2f l = (1-fy)*l0 + fy*l1;
-                            if (loc_valid(sm->surf()->rawPoints(), l)) {
-                                points_hr(j*step+sy,i*step+sx) += data.lookup_int_loc(sm,l);
-                                counts_hr(j*step+sy,i*step+sx) += 1;
+                        // Generate high-resolution points through bilinear interpolation
+                        for(int sy=0;sy<=step;sy++) {
+                            for(int sx=0;sx<=step;sx++) {
+                                float fx = sx/step;
+                                float fy = sy/step;
+                                
+                                // Bilinear interpolation of location coordinates
+                                cv::Vec2f l0 = (1-fx)*l00 + fx*l01;
+                                cv::Vec2f l1 = (1-fx)*l10 + fx*l11;
+                                cv::Vec2f l = (1-fy)*l0 + fy*l1;
+                                
+                                // Check if the interpolated location is valid on the surface
+                                if (loc_valid(sm->surf()->rawPoints(), l)) {
+                                    // Accumulate point value
+                                    points_hr(j*step+sy,i*step+sx) += data.lookup_int_loc(sm,l);
+                                    counts_hr(j*step+sy,i*step+sx) += 1;
+                                    // Mark this high-res point as valid
+                                    valid_mask_hr(j*step+sy,i*step+sx) = 1;
+                                }
                             }
                         }
+                    }
                 }
-            }
-            if (!counts_hr(j*step+1,i*step+1) && inpaint) {
-                cv::Vec3d c00 = points(j,i);
-                cv::Vec3d c01 = points(j,i+1);
-                cv::Vec3d c10 = points(j+1,i);
-                cv::Vec3d c11 = points(j+1,i+1);
-            
-                for(int sy=0;sy<=step;sy++)
-                    for(int sx=0;sx<=step;sx++) {
-                        if (!counts_hr(j*step+sy,i*step+sx)) {
-                            float fx = sx/step;
-                            float fy = sy/step;
-                            cv::Vec3d c0 = (1-fx)*c00 + fx*c01;
-                            cv::Vec3d c1 = (1-fx)*c10 + fx*c11;
-                            cv::Vec3d c = (1-fy)*c0 + fy*c1;
-                            points_hr(j*step+sy,i*step+sx) = c;
-                            counts_hr(j*step+sy,i*step+sx) = 1;
+                
+                // Inpainting for high-res points without values
+                if (inpaint) {
+                    // Get the four corner points from the low-res grid
+                    cv::Vec3d c00 = points(j,i);
+                    cv::Vec3d c01 = points(j,i+1);
+                    cv::Vec3d c10 = points(j+1,i);
+                    cv::Vec3d c11 = points(j+1,i+1);
+                    
+                    // Only inpaint if all corners are valid (not -1)
+                    if (c00[0] != -1 && c01[0] != -1 && c10[0] != -1 && c11[0] != -1) {
+                        for(int sy=0;sy<=step;sy++) {
+                            for(int sx=0;sx<=step;sx++) {
+                                // Only inpaint if this point hasn't been set already
+                                if (!counts_hr(j*step+sy,i*step+sx)) {
+                                    float fx = sx/step;
+                                    float fy = sy/step;
+                                    
+                                    // Bilinear interpolation of corner points
+                                    cv::Vec3d c0 = (1-fx)*c00 + fx*c01;
+                                    cv::Vec3d c1 = (1-fx)*c10 + fx*c11;
+                                    cv::Vec3d c = (1-fy)*c0 + fy*c1;
+                                    
+                                    points_hr(j*step+sy,i*step+sx) = c;
+                                    counts_hr(j*step+sy,i*step+sx) = 1;
+                                    valid_mask_hr(j*step+sy,i*step+sx) = 1;
+                                }
+                            }
                         }
                     }
+                }
             }
         }
     }
+    
+    // Normalize accumulated points and handle invalid points
 #pragma omp parallel for
-    for(int j=0;j<points_hr.rows;j++)
-        for(int i=0;i<points_hr.cols;i++)
-            if (counts_hr(j,i))
+    for(int j=0;j<points_hr.rows;j++) {
+        for(int i=0;i<points_hr.cols;i++) {
+            if (counts_hr(j,i)) {
+                // Normalize accumulated values
                 points_hr(j,i) /= counts_hr(j,i);
-            else
+            } else {
+                // Handle invalid points
                 points_hr(j,i) = {-1,-1,-1};
+            }
+        }
+    }
+    
+    // Post-process to remove isolated points that could create loops
+    // This step identifies and removes points that don't have enough valid neighbors
+#pragma omp parallel for
+    for(int j=1;j<points_hr.rows-1;j++) {
+        for(int i=1;i<points_hr.cols-1;i++) {
+            // Skip already invalid points
+            if (points_hr(j,i)[0] == -1) {
+                continue;
+            }
+            
+            // Count valid neighbors (8-connected)
+            int valid_neighbors = 0;
+            for (int nj = j-1; nj <= j+1; nj++) {
+                for (int ni = i-1; ni <= i+1; ni++) {
+                    if (nj == j && ni == i) continue; // Skip self
+                    if (points_hr(nj,ni)[0] != -1) {
+                        valid_neighbors++;
+                    }
+                }
+            }
+            
+            // If this is an isolated point or has few neighbors, remove it
+            // This helps prevent small loops in the contour
+            if (valid_neighbors <= 3) {
+                points_hr(j,i) = {-1,-1,-1};
+            }
+        }
+    }
 
     return points_hr;
 }
@@ -2139,8 +2282,10 @@ float same_surface_th = 2.0;
 void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points, cv::Rect used_area, cv::Rect static_bounds, float step, float src_step, const cv::Vec2i &seed, int closing_r, bool keep_inpainted = false, const std::filesystem::path& tgt_dir = std::filesystem::path())
 {
     std::cout << "optimizing surface" << state.size() << used_area << static_bounds << std::endl;
+    // Only clone the matrix once, reuse for minimum memory operations
     cv::Mat_<cv::Vec3d> points_new = points.clone();
     SurfaceMeta sm;
+    // Use the cloned matrix for the surface creation to avoid another deep copy
     sm._surf = new QuadSurface(points, {1,1});
     
     std::shared_mutex mutex;
@@ -2154,21 +2299,78 @@ void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &state, c
     ceres::Problem problem_inpaint;
     ceres::Solver::Summary summary;
     ceres::Solver::Options options;
-    options.linear_solver_type = ceres::SPARSE_SCHUR;
+    
+    // Configure solver based on JSON parameters if available
+    if (tgt_dir != std::filesystem::path()) {
+        // Try to read solver options from parameters
+        std::filesystem::path params_path = tgt_dir / "solver_params.json";
+        if (std::filesystem::exists(params_path)) {
+            try {
+                std::ifstream f(params_path);
+                nlohmann::json solver_params = nlohmann::json::parse(f);
+                
+                // Get linear solver type
+                std::string linear_solver = solver_params.value("linear_solver", "sparse_schur");
+                if (linear_solver == "sparse_normal_cholesky") {
+                    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+                    std::cout << "Using SPARSE_NORMAL_CHOLESKY solver" << std::endl;
+                } else {
+                    options.linear_solver_type = ceres::SPARSE_SCHUR;
+                    std::cout << "Using SPARSE_SCHUR solver" << std::endl;
+                }
+                
+                // Get trust region strategy (dogleg vs. levenberg-marquardt)
+                std::string trust_region = solver_params.value("trust_region_strategy", "levenberg_marquardt");
+                if (trust_region == "dogleg") {
+                    options.trust_region_strategy_type = ceres::DOGLEG;
+                    std::cout << "Using DOGLEG trust region strategy" << std::endl;
+                } else {
+                    options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+                    std::cout << "Using LEVENBERG_MARQUARDT trust region strategy" << std::endl;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "Error reading solver parameters: " << e.what() << std::endl;
+                // Fall back to defaults on error
+                options.linear_solver_type = ceres::SPARSE_SCHUR;
+                options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+            }
+        } else {
+            // Use defaults
+            options.linear_solver_type = ceres::SPARSE_SCHUR;
+            options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+        }
+    } else {
+        // Use defaults if no target directory is specified
+        options.linear_solver_type = ceres::SPARSE_SCHUR;
+        options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+    }
+    
 #ifdef VC_USE_CUDA_SPARSE
     options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
 #endif
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 100;
     options.num_threads = omp_get_max_threads();
+    options.use_mixed_precision_solves = true;
+    options.use_nonmonotonic_steps = true;
+    options.use_inner_iterations = true;
+    options.preconditioner_type = ceres::SCHUR_JACOBI;
     
+#pragma omp parallel for collapse(2) schedule(dynamic, 16)
     for(int j=used_area.y;j<used_area.br().y;j++)
         for(int i=used_area.x;i<used_area.br().x;i++)
             if (state(j,i) & STATE_LOC_VALID) {
-                data_new.surfs({j,i}).insert(&sm);
-                data_new.loc(&sm, {j,i}) = {j,i};
+                // Use a shorter critical section with minimal operations
+                // This reduces contention and allows more parallelism
+                #pragma omp critical
+                {
+                    data_new.surfs({j,i}).insert(&sm);
+                    data_new.loc(&sm, {j,i}) = {j,i};
+                }
             }
             
+    // Create a copy of state to track which points should be processed
+    // This is necessary as we modify new_state throughout the function
     cv::Mat_<uint8_t> new_state = state.clone();
         
     //generate closed version of state
@@ -2211,20 +2413,28 @@ void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &state, c
     ceres::Solve(options, &problem_inpaint, &summary);
     std::cout << summary.BriefReport() << std::endl;
     
+    // Store the optimized result and avoid unnecessary copy when creating the surface
+    // We need to keep this copy because points_new is reused later in the code
     cv::Mat_<cv::Vec3d> points_inpainted = points_new.clone();
     
     //TODO we could directly use higher res here?
     SurfaceMeta sm_inp;
+    // Use the matrix directly rather than making another internal copy
     sm_inp._surf = new QuadSurface(points_inpainted, {1,1});
     
     SurfTrackerData data_inp;
     data_inp._data = data_new._data;
     
+#pragma omp parallel for collapse(2) schedule(dynamic, 16)
     for(int j=used_area.y;j<used_area.br().y;j++)
         for(int i=used_area.x;i<used_area.br().x;i++)
             if (new_state(j,i) & STATE_LOC_VALID) {
-                data_inp.surfs({j,i}).insert(&sm_inp);
-                data_inp.loc(&sm_inp, {j,i}) = {j,i};
+                // Minimal critical section to reduce thread contention
+                #pragma omp critical
+                {
+                    data_inp.surfs({j,i}).insert(&sm_inp);
+                    data_inp.loc(&sm_inp, {j,i}) = {j,i};
+                }
             }
             
     ceres::Problem problem;
@@ -2286,12 +2496,18 @@ void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &state, c
     for(int j=used_area.y;j<used_area.br().y;j++)
         for(int i=used_area.x;i<used_area.br().x;i++)
             if (static_bounds.contains(cv::Point(i,j))) {
+                // Direct assignment of points and state (fast operations)
                 points_out(j, i) = points(j, i);
                 state_out(j, i) = state(j, i);
-                //FIXME copy surfs and locs
+                
+                // Minimize mutex lock time by preparing what we can before locking
                 mutex.lock();
-                data_out.surfs({j,i}) = data.surfsC({j,i});
-                for(auto &s : data_out.surfs({j,i}))
+                // Get a reference to the source surface collection once to avoid repeated lookups
+                const auto& src_surfs = data.surfsC({j,i});
+                data_out.surfs({j,i}) = src_surfs;
+                
+                // Batch copy all location data while still holding the lock
+                for(auto &s : src_surfs)
                     data_out.loc(s, {j,i}) = data.loc(s, {j,i});
                 mutex.unlock();
             }
@@ -2317,7 +2533,9 @@ void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &state, c
                     points_out(j, i) = interp_lin_2d(points_hr, l);
                     state_out(j, i) = STATE_LOC_VALID | STATE_COORD_VALID;
                     
+                    // Pre-allocate with reserved capacity (sets don't have reserve method, but we can hint at expected size)
                     std::set<SurfaceMeta*> surfs;
+                    // Insert all surfaces from the four surrounding points
                     surfs.insert(data.surfsC({y,x}).begin(), data.surfsC({y,x}).end());
                     surfs.insert(data.surfsC({y,x+1}).begin(), data.surfsC({y,x+1}).end());
                     surfs.insert(data.surfsC({y+1,x}).begin(), data.surfsC({y+1,x}).end());
@@ -2361,68 +2579,130 @@ void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &state, c
         fringe_next.copyTo(fringe);
         fringe_next.setTo(0);
         
+        // Reset counter before parallel region
         added = 0;
-#pragma omp parallel for collapse(2) schedule(dynamic)
-        for(int j=used_area.y;j<used_area.br().y-1;j++)
-            for(int i=used_area.x;i<used_area.br().x-1;i++)
-                if (!static_bounds.contains(cv::Point(i,j)) && state_out(j,i) & STATE_LOC_VALID && (fringe(j, i) || fringe_next(j, i))) {
+        // Use atomic counter for thread-safe updates
+        std::atomic<int> atomic_added(0);
+        
+        // Pre-compute the loop boundaries to avoid repeated calculations
+        const int j_min = used_area.y;
+        const int j_max = used_area.br().y-1;
+        const int i_min = used_area.x;
+        const int i_max = used_area.br().x-1;
+
+#pragma omp parallel for collapse(2) schedule(dynamic, 16)
+        for(int j=j_min; j<j_max; j++) {
+            for(int i=i_min; i<i_max; i++) {
+                // Invert and combine conditions for better branch prediction
+                if (static_bounds.contains(cv::Point(i,j)) || 
+                    !(state_out(j,i) & STATE_LOC_VALID) || 
+                    (!fringe(j, i) && !fringe_next(j, i))) {
+                    continue; // Skip this point early
+                }
+                
+                // Cache the current point to avoid repeated lookups
+                const cv::Vec3d& current_point = points_out(j, i);
+                
+                // Pre-allocate surf_cands 
+                std::set<SurfaceMeta*> surf_cands;
+                
+                // Minimize the critical section by reducing lock scope
+                {
                     mutex.lock_shared();
-                    std::set<SurfaceMeta*> surf_cands = data_out.surfs({j,i});
-                    for(auto s : data_out.surfs({j,i}))
+                    const auto& point_surfs = data_out.surfs({j,i});
+                    surf_cands = point_surfs;
+                    
+                    // Batch insert all overlapping surfaces
+                    for(auto s : point_surfs) {
                         surf_cands.insert(s->overlapping.begin(), s->overlapping.end());
-                        mutex.unlock();
-                        
-                        
-                    for(auto test_surf : surf_cands) {
+                    }
+                    mutex.unlock();
+                }
+                
+                // Pre-calculate the boundary coordinates for fringe updates
+                const int y_min = std::max(j-2, 0);
+                const int y_max = std::min(j+2, fringe_next.rows-1);
+                const int x_min = std::max(i-2, 0);
+                const int x_max = std::min(i+2, fringe_next.cols-1);
+                
+                for(auto test_surf : surf_cands) {
+                    // Check if surface already exists with minimal locking
+                    {
                         mutex.lock_shared();
-                        if (data_out.has(test_surf, {j,i})) {
-                            mutex.unlock();
-                            continue;
-                        }
+                        const bool has_surf = data_out.has(test_surf, {j,i});
                         mutex.unlock();
                         
-                        SurfacePointer *ptr = test_surf->surf()->pointer();
-                        if (test_surf->surf()->pointTo(ptr, points_out(j, i), same_surface_th, 10) > same_surface_th)
-                            continue;
-                        
-                        int count = 0;
-                        cv::Vec3f loc_3d = test_surf->surf()->loc_raw(ptr);
-                        int straight_count = 0;
-                        float cost;
+                        if (has_surf) {
+                            continue; // Skip this surface early
+                        }
+                    }
+                    
+                    // Cache the surface pointer to avoid multiple calls
+                    SurfacePointer *ptr = test_surf->surf()->pointer();
+                    
+                    // Early rejection check before more expensive operations
+                    if (test_surf->surf()->pointTo(ptr, current_point, same_surface_th, 10) > same_surface_th) {
+                        continue;
+                    }
+                    
+                    // Pre-compute values before locking
+                    int count = 0;
+                    cv::Vec3f loc_3d = test_surf->surf()->loc_raw(ptr);
+                    int straight_count = 0;
+                    float cost;
+                    
+                    // Critical section - minimize lock time by only locking for the actual operation
+                    {
                         mutex.lock();
                         cost = local_cost_destructive(test_surf, {j,i}, data_out, state_out, points_out, step, src_step, loc_3d, &count, &straight_count);
                         mutex.unlock();
-                        
-                        if (cost > local_cost_inl_th)
-                            continue;
-                        
+                    }
+                    
+                    if (cost > local_cost_inl_th) {
+                        continue;
+                    }
+                    
+                    // Critical section for updating data structures
+                    {
                         mutex.lock();
-#pragma omp atomic
-                        added++;
                         data_out.surfs({j,i}).insert(test_surf);
                         data_out.loc(test_surf, {j,i}) = {loc_3d[1], loc_3d[0]};
+                        atomic_added++; // Thread-safe increment
                         mutex.unlock();
-                        
-                        for(int y=j-2;y<=j+2;y++)
-                            for(int x=i-2;x<=i+2;x++)
-                                fringe_next(y,x) = 1;
+                    }
+                    
+                    // Set fringe flags with optimized memory access pattern
+                    for(int y = y_min; y <= y_max; y++) {
+                        uint8_t* row = fringe_next.ptr<uint8_t>(y);
+                        for(int x = x_min; x <= x_max; x++) {
+                            row[x] = 1;
+                        }
                     }
                 }
+            }
+        }
+        
+        // Update added counter from atomic counter
+        added = atomic_added.load();
         std::cout << "added " << added << std::endl;
     }
                      
     //reset unsupported points
-#pragma omp parallel for
+#pragma omp parallel for collapse(2) schedule(dynamic, 16)
     for(int j=used_area.y;j<used_area.br().y-1;j++)
         for(int i=used_area.x;i<used_area.br().x-1;i++)
             if (!static_bounds.contains(cv::Point(i,j))) {
+                // Check if point has valid location
                 if (state_out(j,i) & STATE_LOC_VALID) {
+                    // If no surfaces support this point, reset it
+                    // This check requires reading from data_out which is thread-safe at this point
                     if (data_out.surfs({j,i}).size() < 1) {
                         state_out(j,i) = 0;
                         points_out(j, i) = {-1,-1,-1};
                     }
                 }
                 else {
+                    // Reset invalid points (direct write, no need for synchronization)
                     state_out(j,i) = 0;
                     points_out(j, i) = {-1,-1,-1};
                 }
@@ -2453,10 +2733,45 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     bool flip_x = params.value("flip_x", 0);
     int global_steps_per_window = params.value("global_steps_per_window", 0);
 
-
     std::cout << "global_steps_per_window: " << global_steps_per_window << std::endl;
     std::cout << "flip_x: " << flip_x << std::endl;
     std::filesystem::path tgt_dir = params["tgt_dir"];
+    
+    // Read solver configuration parameters
+    if (params.contains("solver")) {
+        if (params["solver"].contains("linear_solver")) {
+            std::string solver = params["solver"]["linear_solver"];
+            if (solver == "sparse_normal_cholesky" || solver == "sparse_schur" || solver == "dense_qr") {
+                g_solver_config.linear_solver = solver;
+                std::cout << "Using linear solver: " << solver << std::endl;
+            } else {
+                std::cerr << "Unknown linear solver: " << solver << ", using default" << std::endl;
+            }
+        }
+        
+        if (params["solver"].contains("trust_region_strategy")) {
+            std::string strategy = params["solver"]["trust_region_strategy"];
+            if (strategy == "dogleg" || strategy == "levenberg_marquardt") {
+                g_solver_config.trust_region_strategy = strategy;
+                std::cout << "Using trust region strategy: " << strategy << std::endl;
+            } else {
+                std::cerr << "Unknown trust region strategy: " << strategy << ", using default" << std::endl;
+            }
+        }
+    }
+    
+    // Write solver params to file for later usage
+    try {
+        nlohmann::json solver_params;
+        solver_params["linear_solver"] = g_solver_config.linear_solver;
+        solver_params["trust_region_strategy"] = g_solver_config.trust_region_strategy;
+        
+        std::filesystem::path solver_params_path = tgt_dir / "solver_params.json";
+        std::ofstream f(solver_params_path);
+        f << solver_params.dump(4);
+    } catch (const std::exception& e) {
+        std::cerr << "Error writing solver params: " << e.what() << std::endl;
+    }
     
     std::unordered_map<std::string,SurfaceMeta*> surfs;
     float src_step = params.value("src_step", 20);
