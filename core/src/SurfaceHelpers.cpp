@@ -809,10 +809,6 @@ float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t> &stat
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 10000;
     options.function_tolerance = 1e-4;
-    options.use_nonmonotonic_steps = true;
-    options.use_inner_iterations = true;
-    options.use_mixed_precision_solves = true;
-    options.preconditioner_type = ceres::SCHUR_JACOBI;
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
@@ -908,21 +904,18 @@ void _dist_iteration(T &from, T &to, int s)
         for(int j=0;j<s;j++)
             for(int i=0;i<s;i++) {
                 E dist = from(k,j,i);
-                if (dist == magic) {
-                    if (k) dist = _max_d_ign(dist, from(k-1,j,i));
-                    if (k < s-1) dist = _max_d_ign(dist, from(k+1,j,i));
-                    if (j) dist = _max_d_ign(dist, from(k,j-1,i));
-                    if (j < s-1) dist = _max_d_ign(dist, from(k,j+1,i));
-                    if (i) dist = _max_d_ign(dist, from(k,j,i-1));
-                    if (i < s-1) dist = _max_d_ign(dist, from(k,j,i+1));
-                    if (dist != magic)
-                        to(k,j,i) = dist+1;
-                    else
-                        to(k,j,i) = dist;
-                }
-                else
+                if (dist != magic) {
                     to(k,j,i) = dist;
+                    continue;
+                }
 
+                if (k) dist = _max_d_ign(dist, from(k-1,j,i));
+                if (k < s-1) dist = _max_d_ign(dist, from(k+1,j,i));
+                if (j) dist = _max_d_ign(dist, from(k,j-1,i));
+                if (j < s-1) dist = _max_d_ign(dist, from(k,j+1,i));
+                if (i) dist = _max_d_ign(dist, from(k,j,i-1));
+                if (i < s-1) dist = _max_d_ign(dist, from(k,j,i+1));
+                to(k,j,i) = (dist != magic) ? dist+1 : dist;
             }
 }
 
@@ -2038,7 +2031,6 @@ double local_cost(SurfaceMeta *sm, const cv::Vec2i p, SurfTrackerData &data, cv:
         return sqrt(test_loss/count);
 }
 
-// Global reference to configure local_solve
 struct SolverConfigGlobal {
     std::string linear_solver = "dense_qr"; // dense_qr, sparse_normal_cholesky
     std::string trust_region_strategy = "levenberg_marquardt"; // levenberg_marquardt, dogleg
@@ -2051,21 +2043,7 @@ double local_solve(SurfaceMeta *sm, const cv::Vec2i p, SurfTrackerData &data, cv
     surftrack_add_local(sm, p, data, problem, state, points, step, src_step, flags);
 
     ceres::Solver::Options options;
-
-    // Use global solver configuration if available
-    if (g_solver_config.linear_solver == "sparse_normal_cholesky") {
-        options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-    } else {
-        // Default for local_solve is still DENSE_QR as it works well for small problems
-        options.linear_solver_type = ceres::DENSE_QR;
-    }
-
-    if (g_solver_config.trust_region_strategy == "dogleg") {
-        options.trust_region_strategy_type = ceres::DOGLEG;
-    } else {
-        options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
-    }
-
+    options.linear_solver_type = ceres::DENSE_QR;
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 10000;
     ceres::Solver::Summary summary;
