@@ -596,7 +596,7 @@ public:
         *out = (V(1)-fc[0])*c0 + fc[0]*c1;
 
         // std::cout << fc[0] << " from " << c0 << " to " << c1 << f << corner << std::endl;
-        
+
     }
 
 
