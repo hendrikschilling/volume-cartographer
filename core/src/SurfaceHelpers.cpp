@@ -809,6 +809,10 @@ float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t> &stat
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 10000;
     options.function_tolerance = 1e-4;
+    options.use_nonmonotonic_steps = true;
+    options.use_inner_iterations = true;
+    options.use_mixed_precision_solves = true;
+    options.preconditioner_type = ceres::SCHUR_JACOBI;
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
@@ -2034,6 +2038,12 @@ double local_cost(SurfaceMeta *sm, const cv::Vec2i p, SurfTrackerData &data, cv:
         return sqrt(test_loss/count);
 }
 
+// Global reference to configure local_solve
+struct SolverConfigGlobal {
+    std::string linear_solver = "dense_qr"; // dense_qr, sparse_normal_cholesky
+    std::string trust_region_strategy = "levenberg_marquardt"; // levenberg_marquardt, dogleg
+} g_solver_config;
+
 double local_solve(SurfaceMeta *sm, const cv::Vec2i p, SurfTrackerData &data, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points, float step, float src_step, int flags)
 {
     ceres::Problem problem;
@@ -2041,7 +2051,21 @@ double local_solve(SurfaceMeta *sm, const cv::Vec2i p, SurfTrackerData &data, cv
     surftrack_add_local(sm, p, data, problem, state, points, step, src_step, flags);
 
     ceres::Solver::Options options;
-    options.linear_solver_type = ceres::DENSE_QR;
+
+    // Use global solver configuration if available
+    if (g_solver_config.linear_solver == "sparse_normal_cholesky") {
+        options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    } else {
+        // Default for local_solve is still DENSE_QR as it works well for small problems
+        options.linear_solver_type = ceres::DENSE_QR;
+    }
+
+    if (g_solver_config.trust_region_strategy == "dogleg") {
+        options.trust_region_strategy_type = ceres::DOGLEG;
+    } else {
+        options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+    }
+
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 10000;
     ceres::Solver::Summary summary;
@@ -2154,14 +2178,63 @@ void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &state, c
     ceres::Problem problem_inpaint;
     ceres::Solver::Summary summary;
     ceres::Solver::Options options;
-    options.linear_solver_type = ceres::SPARSE_SCHUR;
+
+    // Configure solver based on JSON parameters if available
+    if (tgt_dir != std::filesystem::path()) {
+        // Try to read solver options from parameters
+        std::filesystem::path params_path = tgt_dir / "solver_params.json";
+        if (std::filesystem::exists(params_path)) {
+            try {
+                std::ifstream f(params_path);
+                nlohmann::json solver_params = nlohmann::json::parse(f);
+
+                // Get linear solver type
+                std::string linear_solver = solver_params.value("linear_solver", "sparse_schur");
+                if (linear_solver == "sparse_normal_cholesky") {
+                    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+                    std::cout << "Using SPARSE_NORMAL_CHOLESKY solver" << std::endl;
+                } else {
+                    options.linear_solver_type = ceres::SPARSE_SCHUR;
+                    std::cout << "Using SPARSE_SCHUR solver" << std::endl;
+                }
+
+                // Get trust region strategy (dogleg vs. levenberg-marquardt)
+                std::string trust_region = solver_params.value("trust_region_strategy", "levenberg_marquardt");
+                if (trust_region == "dogleg") {
+                    options.trust_region_strategy_type = ceres::DOGLEG;
+                    std::cout << "Using DOGLEG trust region strategy" << std::endl;
+                } else {
+                    options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+                    std::cout << "Using LEVENBERG_MARQUARDT trust region strategy" << std::endl;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "Error reading solver parameters: " << e.what() << std::endl;
+                // Fall back to defaults on error
+                options.linear_solver_type = ceres::SPARSE_SCHUR;
+                options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+            }
+        } else {
+            // Use defaults
+            options.linear_solver_type = ceres::SPARSE_SCHUR;
+            options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+        }
+    } else {
+        // Use defaults if no target directory is specified
+        options.linear_solver_type = ceres::SPARSE_SCHUR;
+        options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+    }
+
 #ifdef VC_USE_CUDA_SPARSE
     options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
 #endif
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 100;
     options.num_threads = omp_get_max_threads();
-    
+    options.use_mixed_precision_solves = true;
+    options.use_nonmonotonic_steps = true;
+    options.use_inner_iterations = true;
+    options.preconditioner_type = ceres::SCHUR_JACOBI;
+
     for(int j=used_area.y;j<used_area.br().y;j++)
         for(int i=used_area.x;i<used_area.br().x;i++)
             if (state(j,i) & STATE_LOC_VALID) {
@@ -2458,6 +2531,42 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     std::cout << "flip_x: " << flip_x << std::endl;
     std::filesystem::path tgt_dir = params["tgt_dir"];
     
+    // Read solver configuration parameters
+    if (params.contains("solver")) {
+        if (params["solver"].contains("linear_solver")) {
+            std::string solver = params["solver"]["linear_solver"];
+            if (solver == "sparse_normal_cholesky" || solver == "sparse_schur" || solver == "dense_qr") {
+                g_solver_config.linear_solver = solver;
+                std::cout << "Using linear solver: " << solver << std::endl;
+            } else {
+                std::cerr << "Unknown linear solver: " << solver << ", using default" << std::endl;
+            }
+        }
+
+        if (params["solver"].contains("trust_region_strategy")) {
+            std::string strategy = params["solver"]["trust_region_strategy"];
+            if (strategy == "dogleg" || strategy == "levenberg_marquardt") {
+                g_solver_config.trust_region_strategy = strategy;
+                std::cout << "Using trust region strategy: " << strategy << std::endl;
+            } else {
+                std::cerr << "Unknown trust region strategy: " << strategy << ", using default" << std::endl;
+            }
+        }
+    }
+
+    // Write solver params to file for later usage
+    try {
+        nlohmann::json solver_params;
+        solver_params["linear_solver"] = g_solver_config.linear_solver;
+        solver_params["trust_region_strategy"] = g_solver_config.trust_region_strategy;
+
+        std::filesystem::path solver_params_path = tgt_dir / "solver_params.json";
+        std::ofstream f(solver_params_path);
+        f << solver_params.dump(4);
+    } catch (const std::exception& e) {
+        std::cerr << "Error writing solver params: " << e.what() << std::endl;
+    }
+
     std::unordered_map<std::string,SurfaceMeta*> surfs;
     float src_step = params.value("src_step", 20);
     float step = params.value("step", 10);
