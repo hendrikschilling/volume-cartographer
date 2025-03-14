@@ -1889,7 +1889,8 @@ int cond_surftrack_straightloss_3D(int type, SurfaceMeta *sm, const cv::Vec2i &p
     return count;
 }
 
-static float z_loc_loss_w = 0.1;
+// Z-location loss weight - can be turned off by setting to 0 in the JSON config
+float z_loc_loss_w = 0.1;
 
 int add_surftrack_surfloss(SurfaceMeta *sm, const cv::Vec2i p, SurfTrackerData &data, ceres::Problem &problem, const cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points, float step, ceres::ResidualBlockId *res = nullptr, float w = 0.1)
 {
@@ -2789,6 +2790,12 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
                 std::cerr << "Unknown trust region strategy: " << strategy << ", using default" << std::endl;
             }
         }
+        
+        // Configure z-location loss weight
+        if (params["solver"].contains("z_loc_loss_weight")) {
+            z_loc_loss_w = params["solver"]["z_loc_loss_weight"].get<float>();
+            std::cout << "Using z-location loss weight: " << z_loc_loss_w << std::endl;
+        }
     }
 
     // Write solver params to file for later usage
@@ -2796,6 +2803,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
         nlohmann::json solver_params;
         solver_params["linear_solver"] = g_solver_config.linear_solver;
         solver_params["trust_region_strategy"] = g_solver_config.trust_region_strategy;
+        solver_params["z_loc_loss_weight"] = z_loc_loss_w;
 
         std::filesystem::path solver_params_path = tgt_dir / "solver_params.json";
         std::ofstream f(solver_params_path);

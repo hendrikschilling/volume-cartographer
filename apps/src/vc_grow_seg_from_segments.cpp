@@ -159,8 +159,16 @@ int main(int argc, char *argv[])
 
     QuadSurface *surf = grow_surf_from_surfs(src, surfaces, params);
 
-    if (!surf)
+    if (!surf) {
+        // Clean up memory even if we exit early
+        for (auto* sm : surfaces) {
+            if (sm != src) { // Don't delete src twice
+                delete sm;
+            }
+        }
+        delete src;
         return EXIT_SUCCESS;
+    }
 
     (*surf->meta)["source"] = "vc_grow_seg_from_segments";
     (*surf->meta)["vc_grow_seg_from_segments_params"] = params;
@@ -168,6 +176,16 @@ int main(int argc, char *argv[])
     std::string uuid = "auto_surf_trace_";
     fs::path seg_dir = tgt_dir / uuid;
     surf->save(seg_dir, uuid);
+
+    // Clean up memory by deleting all SurfaceMeta objects except src (which will be deleted later)
+    for (auto* sm : surfaces) {
+        if (sm != src) { // Don't delete src twice
+            delete sm;
+        }
+    }
+    
+    // Clean up the src SurfaceMeta object
+    delete src;
 
     return EXIT_SUCCESS;
 }

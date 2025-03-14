@@ -1,7 +1,6 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
-#include "SurfaceHelpers.hpp"  // Include for access to g_solver_config
 
 #include "z5/factory.hxx"
 #include <nlohmann/json.hpp>
@@ -93,31 +92,8 @@ int main(int argc, char *argv[])
     std::ifstream params_f(params_path);
     json params = json::parse(params_f);
 
-    // Initialize solver configuration from JSON parameters if available
-    if (params.contains("solver")) {
-        if (params["solver"].contains("linear_solver")) {
-            std::string solver = params["solver"]["linear_solver"];
-            if (solver == "sparse_normal_cholesky" || solver == "sparse_schur" || 
-                solver == "dense_qr" || solver == "iterative_schur") {
-                extern struct SolverConfigGlobal g_solver_config; // Import the global config
-                g_solver_config.linear_solver = solver;
-                std::cout << "Initializing global solver config with linear solver: " << solver << std::endl;
-            } else {
-                std::cerr << "Unknown linear solver: " << solver << ", using default" << std::endl;
-            }
-        }
-
-        if (params["solver"].contains("trust_region_strategy")) {
-            std::string strategy = params["solver"]["trust_region_strategy"];
-            if (strategy == "dogleg" || strategy == "levenberg_marquardt") {
-                extern struct SolverConfigGlobal g_solver_config; // Import the global config
-                g_solver_config.trust_region_strategy = strategy;
-                std::cout << "Initializing global solver config with trust region strategy: " << strategy << std::endl;
-            } else {
-                std::cerr << "Unknown trust region strategy: " << strategy << ", using default" << std::endl;
-            }
-        }
-    }
+    // The JSON parameters will be passed directly to the functions in SurfaceHelpers.cpp
+    // The grow_surf_from_surfs function will read them and configure z_loc_loss_w
 
     z5::filesystem::handle::Group group(vol_path, z5::FileMode::FileMode::r);
     z5::filesystem::handle::Dataset ds_handle(group, "0", json::parse(std::ifstream(vol_path/"0/.zarray")).value<std::string>("dimension_separator","."));

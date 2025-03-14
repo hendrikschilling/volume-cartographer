@@ -74,6 +74,30 @@ public:
     };
     ~Chunked3d()
     {
+        // Use unique_lock for RAII-style locking with guaranteed unlock
+        {
+            std::unique_lock<std::shared_mutex> lock(_mutex);
+            
+            // Clean up all chunks based on their allocation method
+            for (auto& pair : _chunks) {
+                auto s = C::CHUNK_SIZE;
+                size_t len = s*s*s;
+                size_t len_bytes = len*sizeof(T);
+                
+                if (_cache_dir.empty()) {
+                    // This chunk was allocated with malloc in cache_chunk_safe_alloc
+                    free(pair.second);
+                } else {
+                    // This chunk was allocated with mmap in cache_chunk_safe_mmap
+                    munmap(pair.second, len_bytes);
+                }
+            }
+            
+            // Clear the chunks map after freeing memory
+            _chunks.clear();
+        } // lock is automatically released here
+        
+        // Remove cache directory if not persistent (existing behavior)
         if (!_persistent)
             remove_all(_cache_dir);
     };
@@ -180,10 +204,10 @@ public:
         _mutex.lock_shared();
         if (_chunks.count(id)) {
             chunk = _chunks[id];
-            _mutex.unlock();
+            _mutex.unlock_shared(); // Fixed: use unlock_shared() to match lock_shared()
         }
         else {
-            _mutex.unlock();
+            _mutex.unlock_shared(); // Fixed: use unlock_shared() to match lock_shared()
             chunk = cache_chunk_safe(id);
         }
 
@@ -395,10 +419,10 @@ public:
         _mutex.lock_shared();
         if (_chunks.count(id)) {
             chunk = _chunks[id];
-            _mutex.unlock();
+            _mutex.unlock_shared(); // Fixed: use unlock_shared() to match lock_shared()
         }
         else {
-            _mutex.unlock();
+            _mutex.unlock_shared(); // Fixed: use unlock_shared() to match lock_shared()
             chunk = cache_chunk_safe(id);
         }
 
