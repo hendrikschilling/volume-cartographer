@@ -19,7 +19,55 @@
 struct SolverConfigGlobal {
     std::string linear_solver = "dense_qr"; // dense_qr, sparse_normal_cholesky, sparse_schur, iterative_schur
     std::string trust_region_strategy = "levenberg_marquardt"; // levenberg_marquardt, dogleg
+    bool use_cuda_if_available = true; // Try to use CUDA if available
 } g_solver_config;
+
+// Helper function to configure solver options consistently based on global settings
+void configure_solver_options(ceres::Solver::Options& options, const std::string& preferred_solver = "") {
+    // Use preferred solver if specified, otherwise use global config
+    std::string linear_solver = preferred_solver.empty() ? g_solver_config.linear_solver : preferred_solver;
+    
+    // Configure linear solver based on setting
+    if (linear_solver == "sparse_normal_cholesky") {
+        options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    } else if (linear_solver == "iterative_schur") {
+        options.linear_solver_type = ceres::ITERATIVE_SCHUR;
+        options.preconditioner_type = ceres::SCHUR_JACOBI;
+        // Disable mixed precision for iterative solver
+        options.use_mixed_precision_solves = false;
+    } else if (linear_solver == "dense_qr") {
+        options.linear_solver_type = ceres::DENSE_QR;
+    } else {
+        options.linear_solver_type = ceres::SPARSE_SCHUR;
+    }
+
+    // Configure trust region strategy
+    if (g_solver_config.trust_region_strategy == "dogleg") {
+        options.trust_region_strategy_type = ceres::DOGLEG;
+    } else {
+        options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+    }
+
+    // Only enable mixed precision for specific solvers
+    if (linear_solver == "sparse_normal_cholesky" || 
+        linear_solver == "sparse_schur") {
+        options.use_mixed_precision_solves = true;
+    } else {
+        // Disable for ITERATIVE_SCHUR and DENSE_QR
+        options.use_mixed_precision_solves = false;
+    }
+
+    // Configure CUDA if enabled and available - only for sparse solvers
+#ifdef VC_USE_CUDA_SPARSE
+    if (g_solver_config.use_cuda_if_available) {
+        // Only applicable for sparse solvers
+        if (options.linear_solver_type == ceres::SPARSE_NORMAL_CHOLESKY || 
+            options.linear_solver_type == ceres::SPARSE_SCHUR) {
+            options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
+        }
+    }
+#endif
+}
 
 class ALifeTime
 {
@@ -812,45 +860,15 @@ float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t> &stat
 
     ceres::Solver::Options options;
     
-    // Use global solver configuration if available
-    if (g_solver_config.linear_solver == "sparse_normal_cholesky") {
-        options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-    } else if (g_solver_config.linear_solver == "iterative_schur") {
-        options.linear_solver_type = ceres::ITERATIVE_SCHUR;
-        options.preconditioner_type = ceres::SCHUR_JACOBI;
-        // Disable mixed precision for iterative solver
-        options.use_mixed_precision_solves = false;
-    } else if (g_solver_config.linear_solver == "dense_qr") {
-        options.linear_solver_type = ceres::DENSE_QR;
-    } else {
-        options.linear_solver_type = ceres::SPARSE_SCHUR;
-    }
+    // Use helper function to configure solver options with dense_qr preferred for local optimization
+    configure_solver_options(options, "dense_qr");
     
-    if (g_solver_config.trust_region_strategy == "dogleg") {
-        options.trust_region_strategy_type = ceres::DOGLEG;
-    } else {
-        options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
-    }
-    
+    // Set additional options specific to this solver
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 10000;
     options.function_tolerance = 1e-4;
     options.use_nonmonotonic_steps = true;
     options.use_inner_iterations = true;
-    
-    // Only enable mixed precision for specific solvers
-    if (g_solver_config.linear_solver == "sparse_normal_cholesky" || 
-        g_solver_config.linear_solver == "sparse_schur") {
-        options.use_mixed_precision_solves = true;
-    } else {
-        // Disable for ITERATIVE_SCHUR and DENSE_QR
-        options.use_mixed_precision_solves = false;
-    }
-    
-    // Set preconditioner if not already set for iterative_schur
-    if (g_solver_config.linear_solver != "iterative_schur") {
-        options.preconditioner_type = ceres::SCHUR_JACOBI;
-    }
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
@@ -1110,7 +1128,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     std::cout << "init loss count " << loss_count << std::endl;
 
     ceres::Solver::Options options_big;
-    options_big.linear_solver_type = ceres::SPARSE_SCHUR;
+    configure_solver_options(options_big, "sparse_schur");
     options_big.minimizer_progress_to_stdout = false;
     options_big.max_num_iterations = 10000;
 
@@ -1118,7 +1136,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     ceres::Solve(options_big, &big_problem, &big_summary);
 
     ceres::Solver::Options options;
-    options.linear_solver_type = ceres::DENSE_QR;
+    configure_solver_options(options, "dense_qr");
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 200;
     options.function_tolerance = 1e-3;
@@ -2796,6 +2814,12 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
             z_loc_loss_w = params["solver"]["z_loc_loss_weight"].get<float>();
             std::cout << "Using z-location loss weight: " << z_loc_loss_w << std::endl;
         }
+        
+        // Configure CUDA usage
+        if (params["solver"].contains("use_cuda_if_available")) {
+            g_solver_config.use_cuda_if_available = params["solver"]["use_cuda_if_available"].get<bool>();
+            std::cout << "Using CUDA if available: " << (g_solver_config.use_cuda_if_available ? "yes" : "no") << std::endl;
+        }
     }
 
     // Write solver params to file for later usage
@@ -2804,6 +2828,8 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
         solver_params["linear_solver"] = g_solver_config.linear_solver;
         solver_params["trust_region_strategy"] = g_solver_config.trust_region_strategy;
         solver_params["z_loc_loss_weight"] = z_loc_loss_w;
+        solver_params["use_cuda_if_available"] = g_solver_config.use_cuda_if_available;
+        solver_params["opt_region_scale"] = params.value("opt_region_scale", 1.0f);
 
         std::filesystem::path solver_params_path = tgt_dir / "solver_params.json";
         std::ofstream f(solver_params_path);
@@ -2913,7 +2939,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     std::cout << "starting from " << x0 << " " << y0 << std::endl;
 
     ceres::Solver::Options options;
-    options.linear_solver_type = ceres::DENSE_QR;
+    configure_solver_options(options, "dense_qr");
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 200;
     
@@ -3306,7 +3332,40 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
             cv::Mat_<uint8_t> opt_state = state.clone();
             cv::Mat_<cv::Vec3d> opt_points = points.clone(); 
             
-            cv::Rect active = active_bounds & used_area;
+            // Calculate standard active region as intersection of active_bounds and used_area
+            cv::Rect active_standard = active_bounds & used_area;
+            
+            // Get optimization region scale factor from JSON params (default to 1.0 for current behavior)
+            float opt_region_scale = params.value("opt_region_scale", 1.0f);
+            
+            // Scale the active region from its center 
+            cv::Rect active;
+            if (opt_region_scale > 1.0f) {
+                // Calculate center of the standard active region
+                int center_x = active_standard.x + active_standard.width/2;
+                int center_y = active_standard.y + active_standard.height/2;
+                
+                // Scale dimensions
+                int new_width = static_cast<int>(active_standard.width * opt_region_scale);
+                int new_height = static_cast<int>(active_standard.height * opt_region_scale);
+                
+                // Calculate new origin ensuring we don't go negative
+                int new_x = std::max(0, center_x - new_width/2);
+                int new_y = std::max(0, center_y - new_height/2);
+                
+                // Create the scaled rectangle and make sure it stays within overall bounds
+                active = cv::Rect(new_x, new_y, new_width, new_height) & all;
+                
+                if (opt_region_scale > 1.0f) {
+                    std::cout << "Using scaled optimization region: " << opt_region_scale 
+                              << "x (from " << active_standard.width << "x" << active_standard.height 
+                              << " to " << active.width << "x" << active.height << ")" << std::endl;
+                }
+            } else {
+                // Use standard region if scale is 1.0 or less
+                active = active_standard;
+            }
+            
             optimize_surface_mapping(opt_data, opt_state, opt_points, active, static_bounds, step, src_step, {y0,x0}, closing_r, true, tgt_dir);
             
             copy(opt_data, data, active);
