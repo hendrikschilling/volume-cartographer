@@ -774,11 +774,39 @@ int main(int argc, char *argv[])
     std::ifstream params_f(argv[1]);
     json params = json::parse(params_f);
     
+    // Create local configuration variables
+    float z_loc_loss_weight = 0.0005f;
+    
+    // Initialize z_loc_loss_weight from JSON parameters
+    if (params.contains("solver") && params["solver"].contains("z_loc_loss_weight")) {
+        z_loc_loss_weight = params["solver"]["z_loc_loss_weight"].get<float>();
+        std::cout << "Using z-location loss weight from solver section: " << z_loc_loss_weight << std::endl;
+    } else if (params.contains("z_loc_loss_w")) {
+        z_loc_loss_weight = params["z_loc_loss_w"].get<float>();
+        std::cout << "Using z-location loss weight from top level: " << z_loc_loss_weight << std::endl;
+    }
+    
+    // Write solver params to file for later reference
+    try {
+        nlohmann::json solver_params;
+        solver_params["z_loc_loss_weight"] = z_loc_loss_weight;
+
+        // Use the first output path as location for solver params
+        std::filesystem::path output_dir = argv[3]; // First output path
+        std::filesystem::path solver_params_path = output_dir.parent_path() / "solver_params.json";
+        std::ofstream f(solver_params_path);
+        f << solver_params.dump(4);
+        std::cout << "Saved solver parameters to " << solver_params_path << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error writing solver params: " << e.what() << std::endl;
+    }
+    
     trace_mul = params.value("trace_mul", 1);
     dist_w = params.value("dist_w", 0.3);
     straight_w = params.value("straight_w", 0.02);
     surf_w = params.value("surf_w", 0.1);
-    z_loc_loss_w = params.value("z_loc_loss_w", 0.0005);
+    // Use the z_loc_loss_weight we loaded earlier
+    z_loc_loss_w = z_loc_loss_weight;
     wind_w = params.value("wind_w", 100.0);
     wind_th = params.value("wind_th", 0.3);
     inpaint_back_range = params.value("inpaint_back_range", 40);

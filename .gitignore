@@ -54,3 +54,5 @@ cmake-build*/
 
 # personal
 *.txt
+inliers_sum.tif
+*.ini

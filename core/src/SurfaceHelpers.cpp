@@ -15,6 +15,60 @@
 
 #include <fstream>
 
+// Global reference to configure solvers
+struct SolverConfigGlobal {
+    std::string linear_solver = "dense_qr"; // dense_qr, sparse_normal_cholesky, sparse_schur, iterative_schur
+    std::string trust_region_strategy = "levenberg_marquardt"; // levenberg_marquardt, dogleg
+    bool use_cuda_if_available = true; // Try to use CUDA if available
+} g_solver_config;
+
+// Helper function to configure solver options consistently based on global settings
+void configure_solver_options(ceres::Solver::Options& options, const std::string& preferred_solver = "") {
+    // Use preferred solver if specified, otherwise use global config
+    std::string linear_solver = preferred_solver.empty() ? g_solver_config.linear_solver : preferred_solver;
+    
+    // Configure linear solver based on setting
+    if (linear_solver == "sparse_normal_cholesky") {
+        options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    } else if (linear_solver == "iterative_schur") {
+        options.linear_solver_type = ceres::ITERATIVE_SCHUR;
+        options.preconditioner_type = ceres::SCHUR_JACOBI;
+        // Disable mixed precision for iterative solver
+        options.use_mixed_precision_solves = false;
+    } else if (linear_solver == "dense_qr") {
+        options.linear_solver_type = ceres::DENSE_QR;
+    } else {
+        options.linear_solver_type = ceres::SPARSE_SCHUR;
+    }
+
+    // Configure trust region strategy
+    if (g_solver_config.trust_region_strategy == "dogleg") {
+        options.trust_region_strategy_type = ceres::DOGLEG;
+    } else {
+        options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+    }
+
+    // Only enable mixed precision for specific solvers
+    if (linear_solver == "sparse_normal_cholesky" || 
+        linear_solver == "sparse_schur") {
+        options.use_mixed_precision_solves = true;
+    } else {
+        // Disable for ITERATIVE_SCHUR and DENSE_QR
+        options.use_mixed_precision_solves = false;
+    }
+
+    // Configure CUDA if enabled and available - only for sparse solvers
+#ifdef VC_USE_CUDA_SPARSE
+    if (g_solver_config.use_cuda_if_available) {
+        // Only applicable for sparse solvers
+        if (options.linear_solver_type == ceres::SPARSE_NORMAL_CHOLESKY || 
+            options.linear_solver_type == ceres::SPARSE_SCHUR) {
+            options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
+        }
+    }
+#endif
+}
+
 class ALifeTime
 {
 public:
@@ -805,10 +859,16 @@ float local_optimization(int radius, const cv::Vec2i &p, cv::Mat_<uint8_t> &stat
 
 
     ceres::Solver::Options options;
-    options.linear_solver_type = ceres::SPARSE_SCHUR;
+    
+    // Use helper function to configure solver options with dense_qr preferred for local optimization
+    configure_solver_options(options, "dense_qr");
+    
+    // Set additional options specific to this solver
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 10000;
     options.function_tolerance = 1e-4;
+    options.use_nonmonotonic_steps = true;
+    options.use_inner_iterations = true;
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
@@ -898,27 +958,24 @@ E _max_d_ign(const E &a, const E &b)
 template <typename T, typename E>
 void _dist_iteration(T &from, T &to, int s)
 {
-    E magic = -1;
+    const E magic = -1;
 #pragma omp parallel for
     for(int k=0;k<s;k++)
         for(int j=0;j<s;j++)
             for(int i=0;i<s;i++) {
                 E dist = from(k,j,i);
-                if (dist == magic) {
-                    if (k) dist = _max_d_ign(dist, from(k-1,j,i));
-                    if (k < s-1) dist = _max_d_ign(dist, from(k+1,j,i));
-                    if (j) dist = _max_d_ign(dist, from(k,j-1,i));
-                    if (j < s-1) dist = _max_d_ign(dist, from(k,j+1,i));
-                    if (i) dist = _max_d_ign(dist, from(k,j,i-1));
-                    if (i < s-1) dist = _max_d_ign(dist, from(k,j,i+1));
-                    if (dist != magic)
-                        to(k,j,i) = dist+1;
-                    else
-                        to(k,j,i) = dist;
-                }
-                else
+                if (dist != magic) {
                     to(k,j,i) = dist;
+                    continue;
+                }
 
+                if (k) dist = _max_d_ign(dist, from(k-1,j,i));
+                if (k < s-1) dist = _max_d_ign(dist, from(k+1,j,i));
+                if (j) dist = _max_d_ign(dist, from(k,j-1,i));
+                if (j < s-1) dist = _max_d_ign(dist, from(k,j+1,i));
+                if (i) dist = _max_d_ign(dist, from(k,j,i-1));
+                if (i < s-1) dist = _max_d_ign(dist, from(k,j,i+1));
+                to(k,j,i) = (dist != magic) ? dist+1 : dist;
             }
 }
 
@@ -937,7 +994,7 @@ T distance_transform(const T &chunk, int steps, int size)
         _dist_iteration<T,E>(c2,c1,size);
     }
 
-#pragma omp parallel for
+#pragma omp parallel for collapse(3)
     for(int z=0;z<size;z++)
         for(int y=0;y<size;y++)
             for(int x=0;x<size;x++)
@@ -963,16 +1020,18 @@ struct thresholdedDistance
 
         int good_count = 0;
 
-#pragma omp parallel for
+#pragma omp parallel for collapse(3)
         for(int z=0;z<s;z++)
             for(int y=0;y<s;y++)
-                for(int x=0;x<s;x++)
+                for(int x=0;x<s;x++) {
                     if (large(z,y,x) < TH)
                         outer(z,y,x) = magic;
-        else {
-            good_count++;
-            outer(z,y,x) = 0;
-        }
+                    else {
+                        #pragma omp atomic
+                        good_count++;
+                        outer(z,y,x) = 0;
+                    }
+                }
 
         outer = distance_transform<T,E>(outer, 15, s);
 
@@ -1069,7 +1128,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     std::cout << "init loss count " << loss_count << std::endl;
 
     ceres::Solver::Options options_big;
-    options_big.linear_solver_type = ceres::SPARSE_SCHUR;
+    configure_solver_options(options_big, "sparse_schur");
     options_big.minimizer_progress_to_stdout = false;
     options_big.max_num_iterations = 10000;
 
@@ -1077,7 +1136,7 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
     ceres::Solve(options_big, &big_problem, &big_summary);
 
     ceres::Solver::Options options;
-    options.linear_solver_type = ceres::DENSE_QR;
+    configure_solver_options(options, "dense_qr");
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 200;
     options.function_tolerance = 1e-3;
@@ -1172,24 +1231,41 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                 int ref_count = 0;
                 cv::Vec3d avg = {0,0,0};
                 std::vector<cv::Vec2i> srcs;
-                for(int oy=std::max(p[0]-r,0);oy<=std::min(p[0]+r,locs.rows-1);oy++)
-                    for(int ox=std::max(p[1]-r,0);ox<=std::min(p[1]+r,locs.cols-1);ox++)
+                srcs.reserve((2*r+1)*(2*r+1)); // Pre-allocate for better performance
+
+                const int y_min = std::max(p[0]-r, 0);
+                const int y_max = std::min(p[0]+r, locs.rows-1);
+                const int x_min = std::max(p[1]-r, 0);
+                const int x_max = std::min(p[1]+r, locs.cols-1);
+
+                for(int oy=y_min; oy<=y_max; oy++) {
+                    for(int ox=x_min; ox<=x_max; ox++) {
                         if (state(oy,ox) & STATE_LOC_VALID) {
                             ref_count++;
                             avg += locs(oy,ox);
                             srcs.push_back({oy,ox});
                         }
-                        
+                    }
+                }
+
                 cv::Vec2i best_l = srcs[0];
                 int best_ref_l = -1;
                 int rec_ref_sum = 0;
-                for(cv::Vec2i l : srcs) {
+                for(const cv::Vec2i& l : srcs) {
                     int ref_l = 0;
-                    for(int oy=std::max(l[0]-r,0);oy<=std::min(l[0]+r,locs.rows-1);oy++)
-                        for(int ox=std::max(l[1]-r,0);ox<=std::min(l[1]+r,locs.cols-1);ox++)
+
+                    const int src_y_min = std::max(l[0]-r, 0);
+                    const int src_y_max = std::min(l[0]+r, locs.rows-1);
+                    const int src_x_min = std::max(l[1]-r, 0);
+                    const int src_x_max = std::min(l[1]+r, locs.cols-1);
+
+                    for(int oy=src_y_min; oy<=src_y_max; oy++) {
+                        for(int ox=src_x_min; ox<=src_x_max; ox++) {
                             if (state(oy,ox) & STATE_LOC_VALID)
                                 ref_l++;
-                    
+                        }
+                    }
+
                     rec_ref_sum += ref_l;
                     
                     if (ref_l > best_ref_l) {
@@ -1199,12 +1275,20 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                 }
 
                 int ref_count2 = 0;
-                for(int oy=std::max(p[0]-r2,0);oy<=std::min(p[0]+r2,locs.rows-1);oy++)
-                    for(int ox=std::max(p[1]-r2,0);ox<=std::min(p[1]+r2,locs.cols-1);ox++)
+
+                const int y2_min = std::max(p[0]-r2, 0);
+                const int y2_max = std::min(p[0]+r2, locs.rows-1);
+                const int x2_min = std::max(p[1]-r2, 0);
+                const int x2_max = std::min(p[1]+r2, locs.cols-1);
+
+                for(int oy=y2_min; oy<=y2_max; oy++) {
+                    for(int ox=x2_min; ox<=x2_max; ox++) {
                         // if (state(oy,ox) & (STATE_LOC_VALID | STATE_COORD_VALID)) {
                         if (state(oy,ox) & STATE_LOC_VALID) {
                             ref_count2++;
                         }
+                    }
+                }
 
                 if (ref_count < 2 || ref_count+0.35*rec_ref_sum < curr_ref_min /*|| (generation > 3 && ref_count2 < 14)*/) {
                     state(p) &= ~STATE_PROCESSING;
@@ -1267,12 +1351,18 @@ QuadSurface *space_tracing_quad_phys(z5::Dataset *ds, float scale, ChunkCache *c
                 double dist;
                 interp.Evaluate(locs(p)[2],locs(p)[1],locs(p)[0], &dist);
                 int count = 0;
-                for (auto &off : neighs) {
+
+                const cv::Vec3d curr_loc = locs(p); // Cache the current location
+
+                for (const auto &off : neighs) {
                     if (state(p+off) & STATE_LOC_VALID) {
-                        for(int i=1;i<T;i++) {
-                            float f1 = float(i)/T;
-                            float f2 = 1-f1;
-                            cv::Vec3d l = locs(p)*f1 + locs(p+off)*f2;
+                        const cv::Vec3d neighbor_loc = locs(p+off); // Cache neighbor location
+                        const cv::Vec3d dir = neighbor_loc - curr_loc; // Pre-calculate direction vector
+
+                        for(int i=1; i<T; i++) {
+                            const float f1 = static_cast<float>(i)/T;
+                            // No need to calculate f2 each time - use direct weighted addition
+                            cv::Vec3d l = curr_loc + dir * f1;
                             double d2;
                             interp.Evaluate(l[2],l[1],l[0], &d2);
                             dist = std::max(dist, d2);
@@ -1817,7 +1907,8 @@ int cond_surftrack_straightloss_3D(int type, SurfaceMeta *sm, const cv::Vec2i &p
     return count;
 }
 
-static float z_loc_loss_w = 0.1;
+// Z-location loss weight - can be turned off by setting to 0 in the JSON config
+float z_loc_loss_w = 0.1;
 
 int add_surftrack_surfloss(SurfaceMeta *sm, const cv::Vec2i p, SurfTrackerData &data, ceres::Problem &problem, const cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points, float step, ceres::ResidualBlockId *res = nullptr, float w = 0.1)
 {
@@ -2041,7 +2132,29 @@ double local_solve(SurfaceMeta *sm, const cv::Vec2i p, SurfTrackerData &data, cv
     surftrack_add_local(sm, p, data, problem, state, points, step, src_step, flags);
 
     ceres::Solver::Options options;
-    options.linear_solver_type = ceres::DENSE_QR;
+
+    // Use global solver configuration if available
+    if (g_solver_config.linear_solver == "sparse_normal_cholesky") {
+        options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    } else if (g_solver_config.linear_solver == "iterative_schur") {
+        options.linear_solver_type = ceres::ITERATIVE_SCHUR;
+        // Configure preconditioner for iterative solver
+        options.preconditioner_type = ceres::SCHUR_JACOBI;
+    } else if (g_solver_config.linear_solver == "sparse_schur") {
+        options.linear_solver_type = ceres::SPARSE_SCHUR;
+    } else if (g_solver_config.linear_solver == "dense_qr") {
+        options.linear_solver_type = ceres::DENSE_QR;
+    } else {
+        // Default for local_solve is DENSE_QR as it works well for small problems
+        options.linear_solver_type = ceres::DENSE_QR;
+    }
+
+    if (g_solver_config.trust_region_strategy == "dogleg") {
+        options.trust_region_strategy_type = ceres::DOGLEG;
+    } else {
+        options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+    }
+
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 10000;
     ceres::Solver::Summary summary;
@@ -2056,69 +2169,153 @@ double local_solve(SurfaceMeta *sm, const cv::Vec2i p, SurfTrackerData &data, cv
 
 cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points, cv::Rect &used_area, float step, float step_src, bool inpaint = false)
 {
+    // Create high-resolution matrices for points and counts
     cv::Mat_<cv::Vec3f> points_hr(state.rows*step, state.cols*step, {0,0,0});
     cv::Mat_<int> counts_hr(state.rows*step, state.cols*step, 0);
+
+    // We'll use counts_hr to track valid points (no separate mask needed)
+
 #pragma omp parallel for //FIXME data access is just not threading friendly ...
-    for(int j=used_area.y;j<used_area.br().y-1;j++)
+    for(int j=used_area.y;j<used_area.br().y-1;j++) {
         for(int i=used_area.x;i<used_area.br().x-1;i++) {
+            // Check if all 4 corner points are valid
             if (state(j,i) & (STATE_LOC_VALID|STATE_COORD_VALID)
                 && state(j,i+1) & (STATE_LOC_VALID|STATE_COORD_VALID)
                 && state(j+1,i) & (STATE_LOC_VALID|STATE_COORD_VALID)
                 && state(j+1,i+1) & (STATE_LOC_VALID|STATE_COORD_VALID))
             {
-            for(auto &sm : data.surfsC({j,i})) {
-                if (data.valid_int(sm,{j,i})
-                    && data.valid_int(sm,{j,i+1})
-                    && data.valid_int(sm,{j+1,i})
-                    && data.valid_int(sm,{j+1,i+1}))
-                {
-                    cv::Vec2f l00 = data.loc(sm,{j,i});
-                    cv::Vec2f l01 = data.loc(sm,{j,i+1});
-                    cv::Vec2f l10 = data.loc(sm,{j+1,i});
-                    cv::Vec2f l11 = data.loc(sm,{j+1,i+1});
+                // Process each surface
+                for(auto &sm : data.surfsC({j,i})) {
+                    // Check if all corners have valid intersections with the surface
+                    if (data.valid_int(sm,{j,i})
+                        && data.valid_int(sm,{j,i+1})
+                        && data.valid_int(sm,{j+1,i})
+                        && data.valid_int(sm,{j+1,i+1}))
+                    {
+                        // Get locations for each corner
+                        cv::Vec2f l00 = data.loc(sm,{j,i});
+                        cv::Vec2f l01 = data.loc(sm,{j,i+1});
+                        cv::Vec2f l10 = data.loc(sm,{j+1,i});
+                        cv::Vec2f l11 = data.loc(sm,{j+1,i+1});
 
-                    for(int sy=0;sy<=step;sy++)
-                        for(int sx=0;sx<=step;sx++) {
-                            float fx = sx/step;
-                            float fy = sy/step;
-                            cv::Vec2f l0 = (1-fx)*l00 + fx*l01;
-                            cv::Vec2f l1 = (1-fx)*l10 + fx*l11;
-                            cv::Vec2f l = (1-fy)*l0 + fy*l1;
-                            if (loc_valid(sm->surf()->rawPoints(), l)) {
-                                points_hr(j*step+sy,i*step+sx) += data.lookup_int_loc(sm,l);
-                                counts_hr(j*step+sy,i*step+sx) += 1;
+                        // Check interpolation validity - skip if corners are too far apart
+                        // This helps prevent stretched interpolation that can create loops
+                        float max_dist_squared = 4.0f * step_src * step_src; // Max allowed squared distance
+                        cv::Vec2f diff1 = l00 - l01;
+                        cv::Vec2f diff2 = l00 - l10;
+                        cv::Vec2f diff3 = l11 - l01;
+                        cv::Vec2f diff4 = l11 - l10;
+
+                        float dist1 = diff1.dot(diff1);
+                        float dist2 = diff2.dot(diff2);
+                        float dist3 = diff3.dot(diff3);
+                        float dist4 = diff4.dot(diff4);
+
+                        // Skip this quad if any edge is suspiciously long
+                        if (dist1 > max_dist_squared || dist2 > max_dist_squared ||
+                            dist3 > max_dist_squared || dist4 > max_dist_squared) {
+                            continue;
+                        }
+
+                        // Generate high-resolution points through bilinear interpolation
+                        for(int sy=0;sy<=step;sy++) {
+                            for(int sx=0;sx<=step;sx++) {
+                                float fx = sx/step;
+                                float fy = sy/step;
+
+                                // Bilinear interpolation of location coordinates
+                                cv::Vec2f l0 = (1-fx)*l00 + fx*l01;
+                                cv::Vec2f l1 = (1-fx)*l10 + fx*l11;
+                                cv::Vec2f l = (1-fy)*l0 + fy*l1;
+
+                                // Check if the interpolated location is valid on the surface
+                                if (loc_valid(sm->surf()->rawPoints(), l)) {
+                                    // Accumulate point value
+                                    points_hr(j*step+sy,i*step+sx) += data.lookup_int_loc(sm,l);
+                                    counts_hr(j*step+sy,i*step+sx) += 1;
+                                    // No need to mark separately - counts_hr > 0 indicates validity
+                                }
                             }
                         }
+                    }
                 }
-            }
-            if (!counts_hr(j*step+1,i*step+1) && inpaint) {
-                cv::Vec3d c00 = points(j,i);
-                cv::Vec3d c01 = points(j,i+1);
-                cv::Vec3d c10 = points(j+1,i);
-                cv::Vec3d c11 = points(j+1,i+1);
-            
-                for(int sy=0;sy<=step;sy++)
-                    for(int sx=0;sx<=step;sx++) {
-                        if (!counts_hr(j*step+sy,i*step+sx)) {
-                            float fx = sx/step;
-                            float fy = sy/step;
-                            cv::Vec3d c0 = (1-fx)*c00 + fx*c01;
-                            cv::Vec3d c1 = (1-fx)*c10 + fx*c11;
-                            cv::Vec3d c = (1-fy)*c0 + fy*c1;
-                            points_hr(j*step+sy,i*step+sx) = c;
-                            counts_hr(j*step+sy,i*step+sx) = 1;
+
+                // Inpainting for high-res points without values
+                if (inpaint) {
+                    // Get the four corner points from the low-res grid
+                    cv::Vec3d c00 = points(j,i);
+                    cv::Vec3d c01 = points(j,i+1);
+                    cv::Vec3d c10 = points(j+1,i);
+                    cv::Vec3d c11 = points(j+1,i+1);
+
+                    // Only inpaint if all corners are valid (not -1)
+                    if (c00[0] != -1 && c01[0] != -1 && c10[0] != -1 && c11[0] != -1) {
+                        for(int sy=0;sy<=step;sy++) {
+                            for(int sx=0;sx<=step;sx++) {
+                                // Only inpaint if this point hasn't been set already
+                                if (!counts_hr(j*step+sy,i*step+sx)) {
+                                    float fx = sx/step;
+                                    float fy = sy/step;
+
+                                    // Bilinear interpolation of corner points
+                                    cv::Vec3d c0 = (1-fx)*c00 + fx*c01;
+                                    cv::Vec3d c1 = (1-fx)*c10 + fx*c11;
+                                    cv::Vec3d c = (1-fy)*c0 + fy*c1;
+
+                                    points_hr(j*step+sy,i*step+sx) = c;
+                                    counts_hr(j*step+sy,i*step+sx) = 1;
+                                    // counts_hr > 0 indicates validity
+                                }
+                            }
                         }
                     }
+                }
             }
         }
     }
+
+    // Normalize accumulated points and handle invalid points
 #pragma omp parallel for
-    for(int j=0;j<points_hr.rows;j++)
-        for(int i=0;i<points_hr.cols;i++)
-            if (counts_hr(j,i))
+    for(int j=0;j<points_hr.rows;j++) {
+        for(int i=0;i<points_hr.cols;i++) {
+            if (counts_hr(j,i)) {
+                // Normalize accumulated values
                 points_hr(j,i) /= counts_hr(j,i);
-            else
+            } else {
+                // Handle invalid points
                 points_hr(j,i) = {-1,-1,-1};
+            }
+        }
+    }
+
+    // Post-process to remove isolated points that could create loops
+    // This step identifies and removes points that don't have enough valid neighbors
+#pragma omp parallel for
+    for(int j=1;j<points_hr.rows-1;j++) {
+        for(int i=1;i<points_hr.cols-1;i++) {
+            // Skip already invalid points
+            if (points_hr(j,i)[0] == -1) {
+                continue;
+            }
+
+            // Count valid neighbors (8-connected)
+            int valid_neighbors = 0;
+            for (int nj = j-1; nj <= j+1; nj++) {
+                for (int ni = i-1; ni <= i+1; ni++) {
+                    if (nj == j && ni == i) continue; // Skip self
+                    if (points_hr(nj,ni)[0] != -1) {
+                        valid_neighbors++;
+                    }
+                }
+            }
+
+            // If this is an isolated point or has few neighbors, remove it
+            // This helps prevent small loops in the contour
+            if (valid_neighbors <= 3) {
+                points_hr(j,i) = {-1,-1,-1};
+            }
+        }
+    }
 
     return points_hr;
 }
@@ -2154,7 +2351,60 @@ void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &state, c
     ceres::Problem problem_inpaint;
     ceres::Solver::Summary summary;
     ceres::Solver::Options options;
-    options.linear_solver_type = ceres::SPARSE_SCHUR;
+
+    // Configure solver based on JSON parameters if available
+    if (tgt_dir != std::filesystem::path()) {
+        // Try to read solver options from parameters
+        std::filesystem::path params_path = tgt_dir / "solver_params.json";
+        if (std::filesystem::exists(params_path)) {
+            try {
+                std::ifstream f(params_path);
+                nlohmann::json solver_params = nlohmann::json::parse(f);
+
+                // Get linear solver type
+                std::string linear_solver = solver_params.value("linear_solver", "sparse_schur");
+                if (linear_solver == "sparse_normal_cholesky") {
+                    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+                    std::cout << "Using SPARSE_NORMAL_CHOLESKY solver" << std::endl;
+                } else if (linear_solver == "iterative_schur") {
+                    options.linear_solver_type = ceres::ITERATIVE_SCHUR;
+                    options.use_mixed_precision_solves = false; // Disable mixed precision for iterative solver
+                    std::cout << "Using ITERATIVE_SCHUR solver (mixed precision disabled)" << std::endl;
+                } else if (linear_solver == "dense_qr") {
+                    options.linear_solver_type = ceres::DENSE_QR;
+                    options.use_mixed_precision_solves = false; // Disable mixed precision for dense QR
+                    std::cout << "Using DENSE_QR solver (mixed precision disabled)" << std::endl;
+                } else {
+                    options.linear_solver_type = ceres::SPARSE_SCHUR;
+                    std::cout << "Using SPARSE_SCHUR solver" << std::endl;
+                }
+
+                // Get trust region strategy (dogleg vs. levenberg-marquardt)
+                std::string trust_region = solver_params.value("trust_region_strategy", "levenberg_marquardt");
+                if (trust_region == "dogleg") {
+                    options.trust_region_strategy_type = ceres::DOGLEG;
+                    std::cout << "Using DOGLEG trust region strategy" << std::endl;
+                } else {
+                    options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+                    std::cout << "Using LEVENBERG_MARQUARDT trust region strategy" << std::endl;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "Error reading solver parameters: " << e.what() << std::endl;
+                // Fall back to defaults on error
+                options.linear_solver_type = ceres::SPARSE_SCHUR;
+                options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+            }
+        } else {
+            // Use defaults
+            options.linear_solver_type = ceres::SPARSE_SCHUR;
+            options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+        }
+    } else {
+        // Use defaults if no target directory is specified
+        options.linear_solver_type = ceres::SPARSE_SCHUR;
+        options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+    }
+
 #ifdef VC_USE_CUDA_SPARSE
     options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
 #endif
@@ -2162,11 +2412,30 @@ void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &state, c
     options.max_num_iterations = 100;
     options.num_threads = omp_get_max_threads();
     
+    // Only enable mixed precision for specific solvers
+    if (options.linear_solver_type == ceres::SPARSE_NORMAL_CHOLESKY || 
+        options.linear_solver_type == ceres::SPARSE_SCHUR) {
+        options.use_mixed_precision_solves = true;
+    } else {
+        // Disable for ITERATIVE_SCHUR and DENSE_QR
+        options.use_mixed_precision_solves = false;
+    }
+    
+    options.use_nonmonotonic_steps = true;
+    options.use_inner_iterations = true;
+    options.preconditioner_type = ceres::SCHUR_JACOBI;
+
+#pragma omp parallel for collapse(2) schedule(dynamic, 16)
     for(int j=used_area.y;j<used_area.br().y;j++)
         for(int i=used_area.x;i<used_area.br().x;i++)
             if (state(j,i) & STATE_LOC_VALID) {
-                data_new.surfs({j,i}).insert(&sm);
-                data_new.loc(&sm, {j,i}) = {j,i};
+                // Use a shorter critical section with minimal operations
+                // This reduces contention and allows more parallelism
+                #pragma omp critical
+                {
+                    data_new.surfs({j,i}).insert(&sm);
+                    data_new.loc(&sm, {j,i}) = {j,i};
+                }
             }
             
     cv::Mat_<uint8_t> new_state = state.clone();
@@ -2220,11 +2489,16 @@ void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &state, c
     SurfTrackerData data_inp;
     data_inp._data = data_new._data;
     
+#pragma omp parallel for collapse(2) schedule(dynamic, 16)
     for(int j=used_area.y;j<used_area.br().y;j++)
         for(int i=used_area.x;i<used_area.br().x;i++)
             if (new_state(j,i) & STATE_LOC_VALID) {
-                data_inp.surfs({j,i}).insert(&sm_inp);
-                data_inp.loc(&sm_inp, {j,i}) = {j,i};
+                // Minimal critical section to reduce thread contention
+                #pragma omp critical
+                {
+                    data_inp.surfs({j,i}).insert(&sm_inp);
+                    data_inp.loc(&sm_inp, {j,i}) = {j,i};
+                }
             }
             
     ceres::Problem problem;
@@ -2361,58 +2635,112 @@ void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &state, c
         fringe_next.copyTo(fringe);
         fringe_next.setTo(0);
         
+        // Reset counter before parallel region
         added = 0;
-#pragma omp parallel for collapse(2) schedule(dynamic)
-        for(int j=used_area.y;j<used_area.br().y-1;j++)
-            for(int i=used_area.x;i<used_area.br().x-1;i++)
-                if (!static_bounds.contains(cv::Point(i,j)) && state_out(j,i) & STATE_LOC_VALID && (fringe(j, i) || fringe_next(j, i))) {
+        
+        // Pre-compute the loop boundaries to avoid repeated calculations
+        const int j_min = used_area.y;
+        const int j_max = used_area.br().y-1;
+        const int i_min = used_area.x;
+        const int i_max = used_area.br().x-1;
+
+#pragma omp parallel for collapse(2) schedule(dynamic, 16)
+        for(int j=j_min; j<j_max; j++) {
+            for(int i=i_min; i<i_max; i++) {
+                // Invert and combine conditions for better branch prediction
+                if (static_bounds.contains(cv::Point(i,j)) || 
+                    !(state_out(j,i) & STATE_LOC_VALID) || 
+                    (!fringe(j, i) && !fringe_next(j, i))) {
+                    continue; // Skip this point early
+                }
+                
+                // Cache the current point to avoid repeated lookups
+                const cv::Vec3d& current_point = points_out(j, i);
+                
+                // Pre-allocate surf_cands 
+                std::set<SurfaceMeta*> surf_cands;
+                
+                // Minimize the critical section by reducing lock scope
+                {
                     mutex.lock_shared();
-                    std::set<SurfaceMeta*> surf_cands = data_out.surfs({j,i});
-                    for(auto s : data_out.surfs({j,i}))
+                    const auto& point_surfs = data_out.surfs({j,i});
+                    surf_cands = point_surfs;
+                    
+                    // Batch insert all overlapping surfaces
+                    for(auto s : point_surfs) {
                         surf_cands.insert(s->overlapping.begin(), s->overlapping.end());
-                        mutex.unlock();
-                        
-                        
-                    for(auto test_surf : surf_cands) {
+                    }
+                    mutex.unlock();
+                }
+                
+                // Pre-calculate the boundary coordinates for fringe updates
+                const int y_min = std::max(j-2, 0);
+                const int y_max = std::min(j+2, fringe_next.rows-1);
+                const int x_min = std::max(i-2, 0);
+                const int x_max = std::min(i+2, fringe_next.cols-1);
+                
+                for(auto test_surf : surf_cands) {
+                    // Check if surface already exists with minimal locking
+                    {
                         mutex.lock_shared();
-                        if (data_out.has(test_surf, {j,i})) {
-                            mutex.unlock();
-                            continue;
-                        }
+                        const bool has_surf = data_out.has(test_surf, {j,i});
                         mutex.unlock();
                         
-                        SurfacePointer *ptr = test_surf->surf()->pointer();
-                        if (test_surf->surf()->pointTo(ptr, points_out(j, i), same_surface_th, 10) > same_surface_th)
-                            continue;
-                        
-                        int count = 0;
-                        cv::Vec3f loc_3d = test_surf->surf()->loc_raw(ptr);
-                        int straight_count = 0;
-                        float cost;
+                        if (has_surf) {
+                            continue; // Skip this surface early
+                        }
+                    }
+                    
+                    // Cache the surface pointer to avoid multiple calls
+                    SurfacePointer *ptr = test_surf->surf()->pointer();
+                    
+                    // Early rejection check before more expensive operations
+                    if (test_surf->surf()->pointTo(ptr, current_point, same_surface_th, 10) > same_surface_th) {
+                        continue;
+                    }
+                    
+                    // Pre-compute values before locking
+                    int count = 0;
+                    cv::Vec3f loc_3d = test_surf->surf()->loc_raw(ptr);
+                    int straight_count = 0;
+                    float cost;
+                    
+                    // Critical section - minimize lock time by only locking for the actual operation
+                    {
                         mutex.lock();
                         cost = local_cost_destructive(test_surf, {j,i}, data_out, state_out, points_out, step, src_step, loc_3d, &count, &straight_count);
                         mutex.unlock();
-                        
-                        if (cost > local_cost_inl_th)
-                            continue;
-                        
+                    }
+                    
+                    if (cost > local_cost_inl_th) {
+                        continue;
+                    }
+                    
+                    // Critical section for updating data structures
+                    {
                         mutex.lock();
 #pragma omp atomic
                         added++;
                         data_out.surfs({j,i}).insert(test_surf);
                         data_out.loc(test_surf, {j,i}) = {loc_3d[1], loc_3d[0]};
                         mutex.unlock();
-                        
-                        for(int y=j-2;y<=j+2;y++)
-                            for(int x=i-2;x<=i+2;x++)
-                                fringe_next(y,x) = 1;
+                    }
+                    
+                    // Set fringe flags with optimized memory access pattern
+                    for(int y = y_min; y <= y_max; y++) {
+                        uint8_t* row = fringe_next.ptr<uint8_t>(y);
+                        for(int x = x_min; x <= x_max; x++) {
+                            row[x] = 1;
+                        }
                     }
                 }
+            }
+        }
         std::cout << "added " << added << std::endl;
     }
                      
     //reset unsupported points
-#pragma omp parallel for
+#pragma omp parallel for collapse(2) schedule(dynamic, 16)
     for(int j=used_area.y;j<used_area.br().y-1;j++)
         for(int i=used_area.x;i<used_area.br().x-1;i++)
             if (!static_bounds.contains(cv::Point(i,j))) {
@@ -2458,6 +2786,58 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     std::cout << "flip_x: " << flip_x << std::endl;
     std::filesystem::path tgt_dir = params["tgt_dir"];
     
+    // Read solver configuration parameters
+    if (params.contains("solver")) {
+        if (params["solver"].contains("linear_solver")) {
+            std::string solver = params["solver"]["linear_solver"];
+            if (solver == "sparse_normal_cholesky" || solver == "sparse_schur" || 
+                solver == "dense_qr" || solver == "iterative_schur") {
+                g_solver_config.linear_solver = solver;
+                std::cout << "Using linear solver: " << solver << std::endl;
+            } else {
+                std::cerr << "Unknown linear solver: " << solver << ", using default" << std::endl;
+            }
+        }
+
+        if (params["solver"].contains("trust_region_strategy")) {
+            std::string strategy = params["solver"]["trust_region_strategy"];
+            if (strategy == "dogleg" || strategy == "levenberg_marquardt") {
+                g_solver_config.trust_region_strategy = strategy;
+                std::cout << "Using trust region strategy: " << strategy << std::endl;
+            } else {
+                std::cerr << "Unknown trust region strategy: " << strategy << ", using default" << std::endl;
+            }
+        }
+        
+        // Configure z-location loss weight
+        if (params["solver"].contains("z_loc_loss_weight")) {
+            z_loc_loss_w = params["solver"]["z_loc_loss_weight"].get<float>();
+            std::cout << "Using z-location loss weight: " << z_loc_loss_w << std::endl;
+        }
+        
+        // Configure CUDA usage
+        if (params["solver"].contains("use_cuda_if_available")) {
+            g_solver_config.use_cuda_if_available = params["solver"]["use_cuda_if_available"].get<bool>();
+            std::cout << "Using CUDA if available: " << (g_solver_config.use_cuda_if_available ? "yes" : "no") << std::endl;
+        }
+    }
+
+    // Write solver params to file for later usage
+    try {
+        nlohmann::json solver_params;
+        solver_params["linear_solver"] = g_solver_config.linear_solver;
+        solver_params["trust_region_strategy"] = g_solver_config.trust_region_strategy;
+        solver_params["z_loc_loss_weight"] = z_loc_loss_w;
+        solver_params["use_cuda_if_available"] = g_solver_config.use_cuda_if_available;
+        solver_params["opt_region_scale"] = params.value("opt_region_scale", 1.0f);
+
+        std::filesystem::path solver_params_path = tgt_dir / "solver_params.json";
+        std::ofstream f(solver_params_path);
+        f << solver_params.dump(4);
+    } catch (const std::exception& e) {
+        std::cerr << "Error writing solver params: " << e.what() << std::endl;
+    }
+
     std::unordered_map<std::string,SurfaceMeta*> surfs;
     float src_step = params.value("src_step", 20);
     float step = params.value("step", 10);
@@ -2559,7 +2939,7 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
     std::cout << "starting from " << x0 << " " << y0 << std::endl;
 
     ceres::Solver::Options options;
-    options.linear_solver_type = ceres::DENSE_QR;
+    configure_solver_options(options, "dense_qr");
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 200;
     
@@ -2952,7 +3332,40 @@ QuadSurface *grow_surf_from_surfs(SurfaceMeta *seed, const std::vector<SurfaceMe
             cv::Mat_<uint8_t> opt_state = state.clone();
             cv::Mat_<cv::Vec3d> opt_points = points.clone(); 
             
-            cv::Rect active = active_bounds & used_area;
+            // Calculate standard active region as intersection of active_bounds and used_area
+            cv::Rect active_standard = active_bounds & used_area;
+            
+            // Get optimization region scale factor from JSON params (default to 1.0 for current behavior)
+            float opt_region_scale = params.value("opt_region_scale", 1.0f);
+            
+            // Scale the active region from its center 
+            cv::Rect active;
+            if (opt_region_scale > 1.0f) {
+                // Calculate center of the standard active region
+                int center_x = active_standard.x + active_standard.width/2;
+                int center_y = active_standard.y + active_standard.height/2;
+                
+                // Scale dimensions
+                int new_width = static_cast<int>(active_standard.width * opt_region_scale);
+                int new_height = static_cast<int>(active_standard.height * opt_region_scale);
+                
+                // Calculate new origin ensuring we don't go negative
+                int new_x = std::max(0, center_x - new_width/2);
+                int new_y = std::max(0, center_y - new_height/2);
+                
+                // Create the scaled rectangle and make sure it stays within overall bounds
+                active = cv::Rect(new_x, new_y, new_width, new_height) & all;
+                
+                if (opt_region_scale > 1.0f) {
+                    std::cout << "Using scaled optimization region: " << opt_region_scale 
+                              << "x (from " << active_standard.width << "x" << active_standard.height 
+                              << " to " << active.width << "x" << active.height << ")" << std::endl;
+                }
+            } else {
+                // Use standard region if scale is 1.0 or less
+                active = active_standard;
+            }
+            
             optimize_surface_mapping(opt_data, opt_state, opt_points, active, static_bounds, step, src_step, {y0,x0}, closing_r, true, tgt_dir);
             
             copy(opt_data, data, active);

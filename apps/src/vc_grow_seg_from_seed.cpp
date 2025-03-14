@@ -92,6 +92,9 @@ int main(int argc, char *argv[])
     std::ifstream params_f(params_path);
     json params = json::parse(params_f);
 
+    // The JSON parameters will be passed directly to the functions in SurfaceHelpers.cpp
+    // The grow_surf_from_surfs function will read them and configure z_loc_loss_w
+
     z5::filesystem::handle::Group group(vol_path, z5::FileMode::FileMode::r);
     z5::filesystem::handle::Dataset ds_handle(group, "0", json::parse(std::ifstream(vol_path/"0/.zarray")).value<std::string>("dimension_separator","."));
     std::unique_ptr<z5::Dataset> ds = z5::filesystem::openDataset(ds_handle);

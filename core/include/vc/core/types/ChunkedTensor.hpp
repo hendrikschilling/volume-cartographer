@@ -68,9 +68,36 @@ public:
     Chunked3d(C &compute_f, z5::Dataset *ds, ChunkCache *cache) : _compute_f(compute_f), _ds(ds), _cache(cache)
     {
         _border = compute_f.BORDER;
+        
+        if (_ds)
+            _shape = {_ds->shape()[0],_ds->shape()[1],_ds->shape()[2]};
     };
     ~Chunked3d()
     {
+        // Use unique_lock for RAII-style locking with guaranteed unlock
+        {
+            std::unique_lock<std::shared_mutex> lock(_mutex);
+            
+            // Clean up all chunks based on their allocation method
+            for (auto& pair : _chunks) {
+                auto s = C::CHUNK_SIZE;
+                size_t len = s*s*s;
+                size_t len_bytes = len*sizeof(T);
+                
+                if (_cache_dir.empty()) {
+                    // This chunk was allocated with malloc in cache_chunk_safe_alloc
+                    free(pair.second);
+                } else {
+                    // This chunk was allocated with mmap in cache_chunk_safe_mmap
+                    munmap(pair.second, len_bytes);
+                }
+            }
+            
+            // Clear the chunks map after freeing memory
+            _chunks.clear();
+        } // lock is automatically released here
+        
+        // Remove cache directory if not persistent (existing behavior)
         if (!_persistent)
             remove_all(_cache_dir);
     };
@@ -177,10 +204,10 @@ public:
         _mutex.lock_shared();
         if (_chunks.count(id)) {
             chunk = _chunks[id];
-            _mutex.unlock();
+            _mutex.unlock_shared(); // Fixed: use unlock_shared() to match lock_shared()
         }
         else {
-            _mutex.unlock();
+            _mutex.unlock_shared(); // Fixed: use unlock_shared() to match lock_shared()
             chunk = cache_chunk_safe(id);
         }
 
@@ -392,10 +419,10 @@ public:
         _mutex.lock_shared();
         if (_chunks.count(id)) {
             chunk = _chunks[id];
-            _mutex.unlock();
+            _mutex.unlock_shared(); // Fixed: use unlock_shared() to match lock_shared()
         }
         else {
-            _mutex.unlock();
+            _mutex.unlock_shared(); // Fixed: use unlock_shared() to match lock_shared()
             chunk = cache_chunk_safe(id);
         }
 
@@ -432,9 +459,14 @@ public:
     {
         return Chunked3dAccessor(ar);
     }
+    
+    // Mutex for thread safety
+    std::mutex _mutex;
 
     T &operator()(const cv::Vec3i &p)
     {
+        std::lock_guard<std::mutex> lock(_mutex); // Thread-safe access
+        
         auto s = C::CHUNK_SIZE;
 
         if (_corner[0] == -1)
@@ -465,6 +497,8 @@ public:
 
     T& safe_at(const cv::Vec3i &p)
     {        
+        std::lock_guard<std::mutex> lock(_mutex); // Thread-safe access
+        
         auto s = C::CHUNK_SIZE;
 
         if (_corner[0] == -1)
@@ -529,20 +563,32 @@ class CachedChunked3dInterpolator
 public:
     CachedChunked3dInterpolator(Chunked3d<T,C> &t) : _a(t)
     {
+        std::lock_guard<std::mutex> lock(_mutex); // Thread-safe initialization
         _shape = t.shape();
     };
 
     Chunked3dAccessor<T,C> _a;
+    std::mutex _mutex; // Mutex for thread safety
 
     template <typename V> void Evaluate(const V &z, const V &y, const V &x, V *out)
     {
+        // Make a thread-safe copy of the shape for bounds checking
+        std::vector<int> shape_copy;
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            shape_copy = _shape;
+        }
+        
         cv::Vec3d f = {val(z),val(y),val(x)};
         cv::Vec3i corner = {floor(f[0]),floor(f[1]),floor(f[2])};
+        
+        // Bounds checking
         for(int i=0;i<3;i++) {
             corner[i] = std::max(corner[i], 0);
-            if (_shape.size())
-                corner[i] = std::min(corner[i], _shape[i]-2);
+            if (!shape_copy.empty())
+                corner[i] = std::min(corner[i], shape_copy[i]-2);
         }
+        
         V fc[3] = { z - V(corner[0]), y - V(corner[1]), x - V(corner[2])};
         for(int i=0;i<3;i++) {
             if (fc[i] < V(0))
@@ -551,6 +597,8 @@ public:
                 fc[i] = V(1);
         }
 
+        // Get interpolation values directly without additional locking
+        // The safe_at method now has its own thread safety
         V c000 = V(_a.safe_at(corner));
         V c100 = V(_a.safe_at(corner+cv::Vec3i(1,0,0)));
         V c010 = V(_a.safe_at(corner+cv::Vec3i(0,1,0)));
@@ -560,6 +608,7 @@ public:
         V c011 = V(_a.safe_at(corner+cv::Vec3i(0,1,1)));
         V c111 = V(_a.safe_at(corner+cv::Vec3i(1,1,1)));
 
+        // Trilinear interpolation (unchanged)
         V c00 = (V(1)-fc[2])*c000 + fc[2]*c001;
         V c01 = (V(1)-fc[2])*c010 + fc[2]*c011;
         V c10 = (V(1)-fc[2])*c100 + fc[2]*c101;
@@ -571,7 +620,10 @@ public:
         *out = (V(1)-fc[0])*c0 + fc[0]*c1;
 
         // std::cout << fc[0] << " from " << c0 << " to " << c1 << f << corner << std::endl;
+
     }
+
+
     double  val(const double &v) const { return v; }
     template< typename JetT>
     double  val(const JetT &v) const { return v.a; }
